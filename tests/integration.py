@@ -24,6 +24,7 @@ import starlink_dashboard as sd
 artifacts = Path(__file__).resolve().parent / 'runtime-artifacts'
 artifacts.mkdir(exist_ok=True)
 offline = "--offline" in sys.argv
+dish_location = "--dish-location" in sys.argv
 sd.EXTERNAL_SERVICES = not offline
 sd.APP_DIR = artifacts
 sd.LOCATION_FILE = artifacts / 'location.json'
@@ -51,6 +52,10 @@ counts = {'status': 0, 'history': 0, 'outages': 0}
 started = time.monotonic()
 class Dish(pbgrpc.DeviceServicer):
     def Handle(self, request, context):
+        if request.WhichOneof('request') == 'get_location':
+            if dish_location and time.monotonic()-started < 8:
+                return pb.Response(get_location=pb.GetLocationResponse(lla=pb.LLAPosition(lat=0,lon=0)))
+            context.abort(grpc.StatusCode.PERMISSION_DENIED, 'location not shared')
         if request.WhichOneof('request') == 'get_history':
             counts['history'] += 1
             return pb.Response(dish_get_history=pb.DishGetHistoryResponse(
@@ -90,7 +95,7 @@ else:
     gps_port = os.ttyname(slave)
     write_gps = lambda data: os.write(master, data)
 sd.save_gps_port(gps_port)
-sd.save_location(48.1173,11.5167,'Fixture')
+sd.save_location(12,34,'Manual fallback') if dish_location else sd.save_location(48.1173,11.5167,'Fixture')
 stop = threading.Event()
 def gps_writer():
     while not stop.wait(0.3):
@@ -113,6 +118,9 @@ def seed_checked(self, *args):
                           and list(self._history_times) == sorted(set(self._history_times)))
 sd.Dashboard._seed_history = seed_checked
 app = sd.Dashboard(root)
+assert app._gps_reader is None, "External GPS must not start automatically"
+if not dish_location:
+    app._reconnect_gps(gps_port)
 observations = {}
 def capture(name):
     try:
@@ -149,7 +157,11 @@ def finish():
         observations['history_checks'] = history_checks
         assert len(history_checks) >= 2 and all(history_checks)
         assert observations['metric'] == '8.0'
-        assert app._last_gps['quality'] == 1
+        if dish_location:
+            assert app._gps_reader is None
+            assert app._location_source == 'manual'
+        else:
+            assert app._last_gps['quality'] == 1
         assert counts['status'] >= 4 and counts['history'] >= 2 and counts['outages'] >= 1
         assert not errors
         with next(sd.DataLogger.DATA_DIR.glob('starlink_*.csv')).open() as f:
@@ -158,9 +170,16 @@ def finish():
         uptimes = [int(row['uptime_s']) for row in rows]
         assert uptimes == sorted(set(uptimes)), 'Duplicate or misordered samples'
         assert [row['timestamp_utc'] for row in rows] == sorted(row['timestamp_utc'] for row in rows)
-        assert rows[-1]['gps_lat'] == '48.117300'
-        assert rows[-1]['gps_lon'] == '11.516667'
-        assert rows[-1]['gps_quality'] == '1' and rows[-1]['gps_sats'] == '8'
+        if dish_location:
+            assert any(row['location_source'] == 'dish' and row['location_lat'] == '0.000000'
+                       and row['location_lon'] == '0.000000' for row in rows)
+            assert rows[-1]['location_source'] == 'manual'
+            assert rows[-1]['location_lat'] == '12.000000' and rows[-1]['location_lon'] == '34.000000'
+            assert all(row['gps_lat'] == '' for row in rows)
+        else:
+            assert rows[-1]['gps_lat'] == '48.117300'
+            assert rows[-1]['gps_lon'] == '11.516667'
+            assert rows[-1]['gps_quality'] == '1' and rows[-1]['gps_sats'] == '8'
         assert len(rows) >= 3
         assert rows[-1]['dl_mbps'] == '8.000'
         assert any(row['dl_mbps'] == '' for row in rows), 'Invalid telemetry must still be recorded'
@@ -170,7 +189,8 @@ def finish():
         observations['failure'] = repr(e)
     finally:
         stop.set()
-        app._gps_reader.stop()
+        if app._gps_reader is not None:
+            app._gps_reader.stop()
         app._on_close()
 root.after(14000,finish)
 root.mainloop()

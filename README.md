@@ -75,7 +75,7 @@ optional "likely satellite" estimate:
   uptime, firmware
 - **Location panel** (two columns):
   - *Public IP* — approximate ground-station/PoP location from public IP geolocation
-  - *Dish (GPS)* — live dish position from an NMEA GPS receiver or manually-set coordinates
+  - *Dish location* — built-in dish coordinates when available, with manual coordinates or an optional external GPS
   - Haversine distance between dish and ground station
   - COM-port selector (auto-detect, remembers last port) and Connect / Set-Manual controls
   - **Live 5-line NMEA feed** — the raw serial sentences, auto-scrolling
@@ -129,8 +129,11 @@ optional "likely satellite" estimate:
    ```bash
    pip install -r requirements.txt
    ```
-4. **(Optional) Plug in a USB GPS** receiver that emits NMEA 0183 at 9600 baud and
-   note its COM port.
+4. **No extra GPS is required.** The app tries the dish's own location automatically.
+   For a stationary installation, use **Set Manual…** if the dish does not share
+   coordinates. Monitoring connection quality works without any location.
+   An optional NMEA receiver is useful for a moving installation; select its port
+   and click **Use external GPS** to connect it.
 5. **Run it:**
    ```bash
    python starlink_dashboard.py
@@ -246,9 +249,19 @@ The selected GPS port and any manually-entered dish coordinates are saved to
     correctly the boresight sits ~1° from a real satellite (vs. an impossible ~178°
     "elevation" and an incoherent satellite match before). This also fixed the
     "Likely satellite" estimate, which had been fed the bad elevation.
-- **GPS position** (lat/lon) needs the `get_location` request, which returns
-  `PERMISSION_DENIED` unless enabled on the dish. GPS **fix status** (valid, sat
-  count, filter convergence) is always available via `gps_stats`.
+- **Dish location:** the app tries the local `get_location` API on a separate
+  connection, without delaying telemetry. Access depends on firmware/service plan;
+  [starlink-grpc-tools reports](https://github.com/sparky8512/starlink-grpc-tools#enabling-access-to-location-data)
+  that most plans stopped exposing coordinates in May 2026. Denied/unsupported
+  requests retry after 60 seconds. Missing, invalid or expired coordinates fall
+  back to saved manual coordinates, or leave location blank. No dish settings are changed.
+- **Location controls:** **Set Manual…** selects a fixed position for this session;
+  **Use dish location** restores automatic lookup and stops the external receiver.
+  Startup always tries the dish, using saved manual coordinates as fallback.
+  External serial ports are opened only after clicking **Use external GPS**.
+  CSV `location_source`, `location_lat`, and `location_lon` describe the selected
+  position; existing `gps_*` columns still describe only the external receiver.
+  The new header rotates existing logs to a numbered file without modifying them.
 - **GPS.** NMEA sentences are read on a background thread; `$xxGGA` gives fix
   quality + satellite count, `$xxRMC` gives the A/V status, and GGA supplies the number of satellites used in the fix.
   A valid `*hh` checksum is required; checksum-less or corrupted sentences are ignored. A fix auto-populates the dish coordinates.

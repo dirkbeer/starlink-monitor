@@ -19,6 +19,12 @@ def dashboard():
     d._post = lambda fn,*args: fn(*args)
     d._history_times = deque(maxlen=600)
     d._last_usage_time = None
+    d.location_panel._dish_lat = d.location_panel._dish_lon = None
+    d._location_mode = "auto"
+    d._location_generation = 0
+    d._manual_location = (None,None,"")
+    d._dish_location_received = None
+    d._dish_location_message = "Dish location unavailable"
     d._gps_received = None
     d._location_source = "manual"
     d._sat_generation = 0

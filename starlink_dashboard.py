@@ -210,6 +210,11 @@ message DishGetHistoryResponse {
     repeated float power_in                = 1010 [packed=true];
 }
 
+// Location field numbers: Eitol/starlink-client device/common protobuf bindings.
+// Firmware/service plans may deny or omit this optional API.
+message LLAPosition { double lat = 1; double lon = 2; double alt = 3; }
+message GetLocationRequest {}
+message GetLocationResponse { LLAPosition lla = 1; }
 message GetStatusRequest {}
 message DishGetHistoryRequest {}
 
@@ -217,6 +222,7 @@ message Request {
     uint64 id = 1;
     oneof request {
         GetStatusRequest get_status = 1004;
+        GetLocationRequest get_location = 1017;
         DishGetHistoryRequest get_history = 1007;
     }
 }
@@ -225,6 +231,7 @@ message Response {
     uint64 id = 1;
     oneof response {
         DishGetStatusResponse dish_get_status = 2004;
+        GetLocationResponse get_location = 1017;
         DishGetHistoryResponse dish_get_history = 2006;
     }
 }
@@ -279,6 +286,17 @@ class StarlinkClient:
         req = self.pb2.Request()
         req.get_history.CopyFrom(self.pb2.DishGetHistoryRequest())
         return self.stub.Handle(req, timeout=10).dish_get_history
+
+    def get_location(self):
+        req = self.pb2.Request()
+        req.get_location.SetInParent()
+        response = self.stub.Handle(req, timeout=3)
+        if not response.HasField("get_location") or not response.get_location.HasField("lla"):
+            raise ValueError("Dish did not supply coordinates")
+        lla = response.get_location.lla
+        if not valid_coordinates(lla.lat, lla.lon):
+            raise ValueError("Dish supplied invalid coordinates")
+        return lla.lat, lla.lon
 
 
 # ---------------------------------------------------------------------------
@@ -663,7 +681,7 @@ class StatusBar:
 
 
 # ---------------------------------------------------------------------------
-# IP geolocation (best-effort — Starlink does not expose GPS via gRPC)
+# IP geolocation (approximate public-IP location, not the dish position)
 # ---------------------------------------------------------------------------
 
 def fetch_geolocation():
@@ -766,6 +784,7 @@ LOG_FIELDS = [
     "dish_gps_valid", "dish_gps_sats", "attitude_uncertainty_deg",
     "desired_el_deg", "desired_az_deg",
     "gps_lat", "gps_lon", "gps_sats", "gps_quality",   # serial NMEA receiver
+    "location_source", "location_lat", "location_lon",
     "firmware", "country",
     "cum_dl_gb", "cum_ul_gb",
     "likely_sat", "likely_sat_sep_deg",
@@ -1389,9 +1408,9 @@ class LocationPanel:
         dish_hdr.grid(row=0, column=1, sticky="w", padx=6, pady=(2, 0))
 
         # GPS status row
-        self._gps_var = tk.StringVar(value="GPS: --")
+        self._gps_var = tk.StringVar(value="Dish location: waiting for connection")
         self._gps_label = tk.Label(body, textvariable=self._gps_var, bg=CARD, fg=DIM,
-                                   font=F_SMALL, anchor="w")
+                                   font=F_SMALL, anchor="w", wraplength=235, justify="left")
         self._gps_label.grid(row=1, column=1, sticky="w", padx=(10, 2))
 
         self._dish = {}
@@ -1423,7 +1442,7 @@ class LocationPanel:
         port_frame = tk.Frame(body, bg=CARD)
         port_frame.grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(5, 1))
 
-        tk.Label(port_frame, text="GPS Port:", bg=CARD, fg=DIM,
+        tk.Label(port_frame, text="Optional GPS port:", bg=CARD, fg=DIM,
                  font=F_SMALL).pack(side="left")
 
         self._port_var = tk.StringVar(value=GPS_PORT)
@@ -1436,10 +1455,14 @@ class LocationPanel:
         btn_frame = tk.Frame(body, bg=CARD)
         btn_frame.grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
         self._connect_btn = tk.Button(
-            btn_frame, text="Connect GPS", command=self._on_connect_gps,
+            btn_frame, text="Use external GPS", command=self._on_connect_gps,
             bg=BORDER, fg=TEXT, font=F_SMALL,
             relief="flat", cursor="hand2", padx=6, pady=2)
         self._connect_btn.pack(side="left", padx=(0, 5))
+        self._auto_btn = tk.Button(btn_frame, text="Use dish location", command=lambda: self._on_auto(),
+                                  bg=BORDER, fg=TEXT, font=F_SMALL, relief="flat", padx=6, pady=2)
+        self._auto_btn.pack(side="left", padx=(0, 5))
+        self._on_auto = lambda: None
         tk.Button(btn_frame, text="Set Manual…", command=self._on_set,
                   bg=BORDER, fg=TEXT, font=F_SMALL,
                   relief="flat", cursor="hand2", padx=6, pady=2).pack(side="left")
@@ -1527,12 +1550,13 @@ class LocationPanel:
 
     def set_dish_location(self, lat, lon, label=""):
         self._dish_lat, self._dish_lon = lat, lon
-        self._dish["dish_latlon"].set(f"{lat:.4f}, {lon:.4f}")
+        self._dish["dish_latlon"].set(f"{lat:.4f}, {lon:.4f}" if valid_coordinates(lat, lon) else "--")
         self._dish["dish_label"].set(label or "")
         self._update_distance()
 
     def _update_distance(self):
         if None in (self._gs_lat, self._gs_lon, self._dish_lat, self._dish_lon):
+            self._dist_var.set("--")
             return
         km = _haversine_km(self._dish_lat, self._dish_lon,
                            self._gs_lat, self._gs_lon)
@@ -1678,6 +1702,11 @@ class Dashboard:
         self._gps_received = None
         self._gps_generation = 0
         self._location_source = "manual"
+        self._location_mode = "auto"
+        self._location_generation = 0
+        self._dish_location_received = None
+        self._dish_location_message = "Dish location: waiting for connection"
+        self._manual_location = load_saved_location()
         self._history_times = deque(maxlen=HIST_POINTS)
         self._recording_error = tk.StringVar(value="")
         root.after(100, self._drain_events)
@@ -1716,17 +1745,16 @@ class Dashboard:
         self._poll_thread.start()
         if EXTERNAL_SERVICES:
             threading.Thread(target=self._fetch_location, daemon=True).start()
-        # Restore saved dish location if present (GPS will override when it gets a fix)
-        lat, lon, label = load_saved_location()
-        if lat is not None:
-            self.location_panel.set_dish_location(lat, lon, label)
-        # Start GPS reader; populate port combo with available ports
+        # External GPS stays disconnected until explicitly selected.
         self._gps_reader = None
         self.location_panel._on_connect_gps_cb = self._reconnect_gps
         self.location_panel._refresh_ports()
         saved_port = load_gps_port()
         self.location_panel._port_var.set(saved_port)
-        self._reconnect_gps(saved_port)
+        self.location_panel._on_auto = self._use_dish_location
+        self._restore_manual_location()
+        self._location_thread = threading.Thread(target=self._location_loop, daemon=True)
+        self._location_thread.start()
         # Satellite estimate is on by default — kick off the TLE load now
         # (the checkbox command only fires on user clicks, not on initial value)
         if self._sat_enabled.get():
@@ -1893,12 +1921,88 @@ class Dashboard:
         elif base:
             self._sat_status_var.set(base)
 
+    def _use_dish_location(self):
+        self._location_mode = "auto"
+        self._dish_location_message = "Checking dish location"
+        self._location_generation += 1
+        self._gps_generation += 1
+        if self._gps_reader is not None:
+            self._gps_reader.stop()
+        self._last_gps = {}
+        self._restore_manual_location()
+
+    def _restore_manual_location(self):
+        lat, lon, label = self._manual_location
+        changed = (self._location_source not in ("manual", "none") or
+                   (self.location_panel._dish_lat, self.location_panel._dish_lon) != (lat, lon))
+        self._location_source = "manual" if valid_coordinates(lat, lon) else "none"
+        self.location_panel.set_dish_location(lat, lon, label or "Manual fallback")
+        self.location_panel._dish_hdr_var.set("Dish (manual)" if self._location_source == "manual" else "Dish location")
+        self.location_panel._gps_var.set(self._dish_location_message +
+            ("; using manual location" if self._location_source == "manual" else "; location optional"))
+        self.location_panel._gps_label.config(fg=DIM)
+        if changed:
+            self._last_sat_name, self._last_sat_sep = "", ""
+            self._sat_generation += 1
+
+    def _location_loop(self):
+        # Separate channel/thread: denied or slow location must never delay telemetry.
+        import grpc
+        client = None
+        try:
+            while not self._stop.is_set():
+                delay = 2
+                if self._location_mode == "auto":
+                    generation = self._location_generation
+                    try:
+                        if client is None:
+                            client = StarlinkClient()
+                        coordinates = client.get_location()
+                        message = "Dish location available"
+                    except Exception as error:
+                        coordinates = None
+                        message = "Dish location unavailable"
+                        if isinstance(error, grpc.RpcError) and error.code() in (
+                                grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.UNIMPLEMENTED):
+                            message = "Dish location not shared"
+                            delay = 60
+                        if client is not None:
+                            client.close()
+                            client = None
+                    self._post(self._apply_dish_location, generation, coordinates, message, time.monotonic())
+                self._stop.wait(delay)
+        finally:
+            if client is not None:
+                client.close()
+
+    def _apply_dish_location(self, generation, coordinates, message, received):
+        if self._location_mode != "auto" or generation != self._location_generation:
+            return
+        self._dish_location_message = message
+        if coordinates is None or time.monotonic() - received > GPS_MAX_AGE:
+            self._restore_manual_location()
+            return
+        changed = (self._location_source != "dish" or
+                   (self.location_panel._dish_lat, self.location_panel._dish_lon) != coordinates)
+        self._dish_location_received = received
+        self._location_source = "dish"
+        self.location_panel.set_dish_location(*coordinates, "Built-in dish location")
+        self.location_panel._dish_hdr_var.set("Dish (built-in)")
+        self.location_panel._gps_var.set(message)
+        self.location_panel._gps_label.config(fg=GREEN)
+        if changed:
+            self._last_sat_name, self._last_sat_sep = "", ""
+            self._sat_generation += 1
+
     def _reconnect_gps(self, port):
         save_gps_port(port)
+        self._location_mode = "external"
+        self._location_generation += 1
         self._gps_generation += 1
         generation = self._gps_generation
         if self._gps_reader is not None:
             self._gps_reader.stop()
+        self._restore_manual_location()
         self._apply_gps_update(None, None, 0, 0)
         self.location_panel.set_gps_connecting(port)
         self._start_gps_when_ready(generation, port)
@@ -1930,13 +2034,15 @@ class Dashboard:
         if valid:
             self._location_source = "gps"
         elif self._location_source == "gps":
-            self.location_panel._dish_lat = self.location_panel._dish_lon = None
-            self._last_sat_name, self._last_sat_sep = "", ""
-            self._sat_generation += 1
+            self._restore_manual_location()
         self.location_panel.set_gps_status(lat if valid else None, lon if valid else None,
                                            quality, num_sats)
 
     def _expire_gps(self):
+        if (self._location_source == "dish" and self._dish_location_received is not None
+                and time.monotonic() - self._dish_location_received > GPS_MAX_AGE):
+            self._dish_location_message = "Dish location expired"
+            self._restore_manual_location()
         if (self._gps_received is not None and self._last_gps.get("quality", 0) > 0
                 and time.monotonic() - self._gps_received > GPS_MAX_AGE):
             self._apply_gps_update(None, None, 0, 0)
@@ -2143,8 +2249,15 @@ class Dashboard:
                 return
             label = entries["label"].get().strip()
             save_location(lat, lon, label)
-            self._location_source = "manual"
-            self.location_panel.set_dish_location(lat, lon, label)
+            self._manual_location = (lat, lon, label)
+            self._location_mode = "manual"
+            self._location_generation += 1
+            self._gps_generation += 1
+            if self._gps_reader is not None:
+                self._gps_reader.stop()
+            self._last_gps = {}
+            self._dish_location_message = "Manual location selected"
+            self._restore_manual_location()
             dlg.destroy()
 
         btn_frame = tk.Frame(dlg, bg=BG)
@@ -2340,6 +2453,9 @@ class Dashboard:
                 "attitude_uncertainty_deg": formatted(al.attitude_uncertainty_deg, ".4f"),
                 "desired_el_deg":      formatted(al.desired_boresight_elevation_deg, ".2f"),
                 "desired_az_deg":      formatted(al.desired_boresight_azimuth_deg, ".2f"),
+                "location_source":     self._location_source,
+                "location_lat":        formatted(self.location_panel._dish_lat, ".6f"),
+                "location_lon":        formatted(self.location_panel._dish_lon, ".6f"),
                 "gps_lat":             formatted(gps_nmea['lat'], ".6f") if gps_nmea.get("lat") is not None else "",
                 "gps_lon":             formatted(gps_nmea['lon'], ".6f") if gps_nmea.get("lon") is not None else "",
                 "gps_sats":            gps_nmea.get("sats", ""),

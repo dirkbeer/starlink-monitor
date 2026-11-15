@@ -82,5 +82,15 @@ upstream; this requirement is now explicit in the README.
 
 The integration checks assert CSV values and ordering, wrapped history content,
 and an offline startup with external requests forbidden. The regression suite
-has 30 tests (the POSIX file-size-limit test is skipped on Windows). The native
+has 34 tests (the POSIX file-size-limit test is skipped on Windows). The native
 CI matrices disable fail-fast so independent jobs can finish after a failure.
+
+Dish-location follow-up: review automatic read-only `get_location` polling on a
+separate connection, permission-denied backoff, missing/invalid/stale coordinate
+handling, manual fallback, and explicit external-GPS selection. Run
+`xvfb-run -a .venv/bin/python tests/integration.py --offline --dish-location`
+for the real Tk/gRPC success-to-denial fallback scenario. No physical dish is
+available yet; fixtures validate protocol handling, not access on a service plan.
+Protocol field numbers are cross-checked against the generated bindings in
+https://github.com/Eitol/starlink-client/blob/main/libs/golang/client/gen/spacex/api/device/device.pb.go
+and the LLAPosition fields in the same project's common bindings.
