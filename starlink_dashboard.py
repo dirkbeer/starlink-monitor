@@ -296,6 +296,10 @@ class StarlinkClient:
         lla = response.get_location.lla
         if not valid_coordinates(lla.lat, lla.lon):
             raise ValueError("Dish supplied invalid coordinates")
+        # Proto3 cannot distinguish omitted scalar coordinates from real zeroes.
+        # Corroborate an entirely default position with the dish's GPS fix status.
+        if lla.lat == lla.lon == lla.alt == 0 and not self.get_status().gps_stats.gps_valid:
+            raise ValueError("Empty dish position without a valid GPS fix")
         return lla.lat, lla.lon
 
 
@@ -784,10 +788,10 @@ LOG_FIELDS = [
     "dish_gps_valid", "dish_gps_sats", "attitude_uncertainty_deg",
     "desired_el_deg", "desired_az_deg",
     "gps_lat", "gps_lon", "gps_sats", "gps_quality",   # serial NMEA receiver
-    "location_source", "location_lat", "location_lon",
     "firmware", "country",
     "cum_dl_gb", "cum_ul_gb",
     "likely_sat", "likely_sat_sep_deg",
+    "location_source", "location_lat", "location_lon",
 ]
 
 
@@ -800,19 +804,27 @@ class DataLogger:
         self.DATA_DIR.mkdir(exist_ok=True)
         self._date = None
         self._fh   = None
-        self._csv  = None
+        self._pending_rollback = None
 
     @staticmethod
     def _header_matches(path):
         """True if the file's first row equals the current LOG_FIELDS."""
         try:
             with open(path, newline="", encoding="utf-8") as f:
-                return next(csv.reader(f), None) == LOG_FIELDS
+                matches = next(csv.reader(f), None) == LOG_FIELDS
+            with open(path, "rb") as raw:
+                raw.seek(-1, os.SEEK_END)
+                return matches and raw.read(1) == b"\n"
         except Exception:
             return False
 
     def _rotate(self):
         today = datetime.datetime.now(datetime.timezone.utc).date()
+        if self._pending_rollback is not None:
+            path, offset = self._pending_rollback
+            with open(path, "r+b") as damaged:
+                damaged.truncate(offset)
+            self._pending_rollback = None
         if today == self._date and self._fh and not self._fh.closed:
             return
         # Commit state only after the replacement is ready.
@@ -829,22 +841,22 @@ class DataLogger:
             csv.writer(header).writerow(LOG_FIELDS)
             # A failed/partial header never becomes a candidate day file.
             atomic_write(path, header.getvalue())
-        fh = open(path, "a", newline="", encoding="utf-8")
-        try:
-            writer = csv.writer(fh)
-            fh.flush()
-        except Exception:
-            fh.close()
-            raise
+        fh = open(path, "ab", buffering=0)
         if self._fh:
             self._fh.close()
-        self._fh, self._csv, self._date = fh, writer, today
+        self._fh, self._date = fh, today
 
     def log(self, row: dict):
         try:
             self._rotate()
-            self._csv.writerow([row.get(f, "") for f in LOG_FIELDS])
-            self._fh.flush()
+            buffer = io.StringIO(newline="")
+            csv.writer(buffer).writerow([row.get(f, "") for f in LOG_FIELDS])
+            data = buffer.getvalue().encode("utf-8")
+            offset = self._fh.tell()
+            self._pending_rollback = (self._fh.name, offset)
+            if self._fh.write(data) != len(data):
+                raise OSError("Incomplete CSV row write")
+            self._pending_rollback = None
         except (OSError, ValueError):
             self.close()
             raise
@@ -1051,8 +1063,12 @@ class SatelliteMatcher:
         if len(data) < 100 or "\n1 " not in ("\n" + data):
             raise RuntimeError("empty/invalid TLE response")
         _, records = self._parse_catalogue(data)
-        if not records:
-            raise ValueError("No valid TLE orbits in download")
+        if len(records) < 50:
+            raise ValueError("TLE download has fewer than 50 valid orbits")
+        if self.CACHE.exists():
+            _, previous = self._parse_catalogue(self.CACHE.read_text(encoding="utf-8"))
+            if len(previous) >= 100 and len(records) < len(previous) / 2:
+                raise ValueError("TLE download lost over half the catalogue; retaining prior cache")
         atomic_write(self.CACHE, data)
 
     @staticmethod
@@ -1359,6 +1375,21 @@ def load_gps_port():
     """Return persisted GPS port, or GPS_PORT default."""
     return _load_config().get("gps_port", GPS_PORT)
 
+def load_location_mode():
+    config = _load_config()
+    mode = config.get("location_mode")
+    if mode in ("auto", "manual", "external"):
+        return mode
+    # Older releases always connected the saved port. Preserve that setup.
+    return "external" if config.get("gps_port") else "auto"
+
+
+def save_location_mode(mode):
+    config = _load_config()
+    config["location_mode"] = mode
+    _save_config(config)
+
+
 def save_gps_port(port):
     d = _load_config()
     d["gps_port"] = port
@@ -1620,9 +1651,16 @@ class GpsReader:
         while not self._stop.is_set():
             try:
                 with serial.Serial(port, baud, timeout=0.2) as ser:
+                    pending = b""
                     while not self._stop.is_set():
                         try:
-                            raw = ser.readline()
+                            pending += ser.readline()
+                            if len(pending) > 4096:
+                                pending = b""  # bound malformed/no-newline input
+                                continue
+                            if not pending.endswith(b"\n"):
+                                continue
+                            raw, pending = pending, b""
                             line = raw.decode("ascii", errors="ignore").strip()
                             if self._on_raw and line.startswith("$"):
                                 self._on_raw(line)
@@ -1702,7 +1740,8 @@ class Dashboard:
         self._gps_received = None
         self._gps_generation = 0
         self._location_source = "manual"
-        self._location_mode = "auto"
+        self._location_mode = load_location_mode()
+        self._location_wake = threading.Event()
         self._location_generation = 0
         self._dish_location_received = None
         self._dish_location_message = "Dish location: waiting for connection"
@@ -1745,7 +1784,7 @@ class Dashboard:
         self._poll_thread.start()
         if EXTERNAL_SERVICES:
             threading.Thread(target=self._fetch_location, daemon=True).start()
-        # External GPS stays disconnected until explicitly selected.
+        # Restore an explicitly selected (or legacy saved) external receiver.
         self._gps_reader = None
         self.location_panel._on_connect_gps_cb = self._reconnect_gps
         self.location_panel._refresh_ports()
@@ -1753,6 +1792,8 @@ class Dashboard:
         self.location_panel._port_var.set(saved_port)
         self.location_panel._on_auto = self._use_dish_location
         self._restore_manual_location()
+        if self._location_mode == "external":
+            self._reconnect_gps(saved_port)
         self._location_thread = threading.Thread(target=self._location_loop, daemon=True)
         self._location_thread.start()
         # Satellite estimate is on by default — kick off the TLE load now
@@ -1779,7 +1820,7 @@ class Dashboard:
                 try:
                     callback(*args)
                 except Exception:
-                    self.root.report_callback_exception(*sys.exc_info())
+                    self._report_event_error()
             self._expire_gps()
             if self._sat_on and not self._sat_loading and time.monotonic() >= self._sat_refresh_at:
                 self._sat_loading = True
@@ -1791,10 +1832,16 @@ class Dashboard:
                     raise
         except Exception:
             self._recording_error.set("Monitor update error; retrying (see crash.log)")
-            self.root.report_callback_exception(*sys.exc_info())
+            self._report_event_error()
         finally:
             if not self._stop.is_set():
                 self.root.after(100, self._drain_events)
+
+    def _report_event_error(self):
+        now = time.monotonic()
+        if now >= getattr(self, "_next_event_error_log", 0):
+            self._next_event_error_log = now + 60
+            self.root.report_callback_exception(*sys.exc_info())
 
     def _on_toggle_sat(self):
         self._sat_generation += 1
@@ -1922,6 +1969,7 @@ class Dashboard:
             self._sat_status_var.set(base)
 
     def _use_dish_location(self):
+        save_location_mode("auto")
         self._location_mode = "auto"
         self._dish_location_message = "Checking dish location"
         self._location_generation += 1
@@ -1930,6 +1978,7 @@ class Dashboard:
             self._gps_reader.stop()
         self._last_gps = {}
         self._restore_manual_location()
+        self._location_wake.set()
 
     def _restore_manual_location(self):
         lat, lon, label = self._manual_location
@@ -1951,9 +2000,11 @@ class Dashboard:
         client = None
         try:
             while not self._stop.is_set():
+                self._location_wake.clear()
                 delay = 2
                 if self._location_mode == "auto":
                     generation = self._location_generation
+                    discard = False
                     try:
                         if client is None:
                             client = StarlinkClient()
@@ -1965,21 +2016,28 @@ class Dashboard:
                         if isinstance(error, grpc.RpcError) and error.code() in (
                                 grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.UNIMPLEMENTED):
                             message = "Dish location not shared"
+                            discard = True
                             delay = 60
                         if client is not None:
                             client.close()
                             client = None
-                    self._post(self._apply_dish_location, generation, coordinates, message, time.monotonic())
-                self._stop.wait(delay)
+                    self._post(self._apply_dish_location, generation, coordinates, message, time.monotonic(), discard)
+                if not self._stop.is_set():
+                    self._location_wake.wait(delay)
         finally:
             if client is not None:
                 client.close()
 
-    def _apply_dish_location(self, generation, coordinates, message, received):
+    def _apply_dish_location(self, generation, coordinates, message, received, discard=False):
         if self._location_mode != "auto" or generation != self._location_generation:
             return
         self._dish_location_message = message
         if coordinates is None or time.monotonic() - received > GPS_MAX_AGE:
+            if (not discard and self._location_source == "dish" and
+                    self._dish_location_received is not None and
+                    time.monotonic() - self._dish_location_received <= GPS_MAX_AGE):
+                self.location_panel._gps_var.set("Dish location: retrying (last fix)")
+                return
             self._restore_manual_location()
             return
         changed = (self._location_source != "dish" or
@@ -1996,6 +2054,7 @@ class Dashboard:
 
     def _reconnect_gps(self, port):
         save_gps_port(port)
+        save_location_mode("external")
         self._location_mode = "external"
         self._location_generation += 1
         self._gps_generation += 1
@@ -2005,13 +2064,17 @@ class Dashboard:
         self._restore_manual_location()
         self._apply_gps_update(None, None, 0, 0)
         self.location_panel.set_gps_connecting(port)
-        self._start_gps_when_ready(generation, port)
+        self._start_gps_when_ready(generation, port, time.monotonic() + 3)
 
-    def _start_gps_when_ready(self, generation, port):
+    def _start_gps_when_ready(self, generation, port, deadline):
         if self._stop.is_set() or generation != self._gps_generation:
             return
         if self._gps_reader is not None and self._gps_reader._thread.is_alive():
-            self.root.after(50, self._start_gps_when_ready, generation, port)
+            if time.monotonic() >= deadline:
+                self.location_panel._gps_var.set("GPS did not stop; reconnect device and retry")
+                self.location_panel._gps_label.config(fg=RED)
+                return
+            self.root.after(50, self._start_gps_when_ready, generation, port, deadline)
             return
         self._gps_reader = GpsReader(
             port, GPS_BAUD,
@@ -2049,6 +2112,7 @@ class Dashboard:
 
     def _on_close(self):
         self._stop.set()
+        self._location_wake.set()
         if self._gps_reader is not None:
             self._gps_reader.stop()
         client = self._client
@@ -2250,6 +2314,7 @@ class Dashboard:
             label = entries["label"].get().strip()
             save_location(lat, lon, label)
             self._manual_location = (lat, lon, label)
+            save_location_mode("manual")
             self._location_mode = "manual"
             self._location_generation += 1
             self._gps_generation += 1

@@ -82,7 +82,7 @@ upstream; this requirement is now explicit in the README.
 
 The integration checks assert CSV values and ordering, wrapped history content,
 and an offline startup with external requests forbidden. The regression suite
-has 34 tests (the POSIX file-size-limit test is skipped on Windows). The native
+has 42 tests (the POSIX file-size-limit test is skipped on Windows). The native
 CI matrices disable fail-fast so independent jobs can finish after a failure.
 
 Dish-location follow-up: review automatic read-only `get_location` polling on a
@@ -94,3 +94,12 @@ available yet; fixtures validate protocol handling, not access on a service plan
 Protocol field numbers are cross-checked against the generated bindings in
 https://github.com/Eitol/starlink-client/blob/main/libs/golang/client/gen/spacex/api/device/device.pb.go
 and the LLAPosition fields in the same project's common bindings.
+
+Follow-up to the review at `dac05d3`: source choice now persists (legacy saved
+ports migrate to external GPS), transient failures retain a fix until expiry,
+and the dish-location button wakes backoff immediately. Default-zero positions
+need corroborating GPS status; real hardware semantics remain unverified. CSV
+fields are appended, partial writes roll back before retry, serial fragments
+survive read timeouts, repeated pump errors are rate-limited, and truncated TLE
+downloads preserve a larger cache. A stuck GPS shutdown reports a deadline
+instead of starting a competing reader on the same port.

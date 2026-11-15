@@ -54,7 +54,7 @@ class Dish(pbgrpc.DeviceServicer):
     def Handle(self, request, context):
         if request.WhichOneof('request') == 'get_location':
             if dish_location and time.monotonic()-started < 8:
-                return pb.Response(get_location=pb.GetLocationResponse(lla=pb.LLAPosition(lat=0,lon=0)))
+                return pb.Response(get_location=pb.GetLocationResponse(lla=pb.LLAPosition(lat=0,lon=0,alt=10)))
             context.abort(grpc.StatusCode.PERMISSION_DENIED, 'location not shared')
         if request.WhichOneof('request') == 'get_history':
             counts['history'] += 1
@@ -95,6 +95,7 @@ else:
     gps_port = os.ttyname(slave)
     write_gps = lambda data: os.write(master, data)
 sd.save_gps_port(gps_port)
+sd.save_location_mode("auto")
 sd.save_location(12,34,'Manual fallback') if dish_location else sd.save_location(48.1173,11.5167,'Fixture')
 stop = threading.Event()
 def gps_writer():

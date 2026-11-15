@@ -253,12 +253,17 @@ The selected GPS port and any manually-entered dish coordinates are saved to
   connection, without delaying telemetry. Access depends on firmware/service plan;
   [starlink-grpc-tools reports](https://github.com/sparky8512/starlink-grpc-tools#enabling-access-to-location-data)
   that most plans stopped exposing coordinates in May 2026. Denied/unsupported
-  requests retry after 60 seconds. Missing, invalid or expired coordinates fall
-  back to saved manual coordinates, or leave location blank. No dish settings are changed.
-- **Location controls:** **Set Manual…** selects a fixed position for this session;
+  requests retry after 60 seconds; **Use dish location** retries immediately.
+  Transient failures retain the last fix for up to 10 seconds. Denied access or
+  expired coordinates fall back to saved manual coordinates, or leave location
+  blank. An entirely default 0°, 0°, 0 m response also needs a valid dish GPS
+  status, since omitted numeric fields cannot be distinguished from real zeroes.
+  No dish settings are changed.
+- **Location controls:** **Set Manual…** selects a fixed position;
   **Use dish location** restores automatic lookup and stops the external receiver.
-  Startup always tries the dish, using saved manual coordinates as fallback.
-  External serial ports are opened only after clicking **Use external GPS**.
+  The selected mode is remembered across restarts. New installations default to
+  dish lookup; older configurations with a saved GPS port keep connecting that
+  receiver automatically. **Use external GPS** selects and remembers that mode.
   CSV `location_source`, `location_lat`, and `location_lon` describe the selected
   position; existing `gps_*` columns still describe only the external receiver.
   The new header rotates existing logs to a numbered file without modifying them.
@@ -296,3 +301,19 @@ The fastest way to re-verify and adapt:
 This tool talks only to your own dish on your local network; it does not contact
 SpaceX servers. Field numbers are empirical and may change with firmware. Use at
 your own risk.
+
+### Diagnostic commands
+
+`python starlink_dashboard.py --dish-host HOST:PORT` overrides the local dish
+endpoint (normally `192.168.100.1:9200`). `--selftest result.json` performs status
+and history RPCs, writes a JSON result, and exits without opening the GUI. It
+returns a nonzero exit code if the check fails. These options also work with the
+packaged executable. The self-test does not verify physical location access.
+
+Dish coordinates, when available and selected, are written automatically to CSV.
+The selected-location fields are appended after the existing columns. Logs stay
+on this computer; treat them as location data when sharing diagnostics.
+
+Catalogue downloads must contain at least 50 valid records and must retain at
+least half of a previously cached catalogue of 100 or more records. Rejected
+downloads leave the prior cache and its age unchanged.

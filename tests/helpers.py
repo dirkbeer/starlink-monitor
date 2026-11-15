@@ -21,6 +21,7 @@ def dashboard():
     d._last_usage_time = None
     d.location_panel._dish_lat = d.location_panel._dish_lon = None
     d._location_mode = "auto"
+    d._location_wake = threading.Event()
     d._location_generation = 0
     d._manual_location = (None,None,"")
     d._dish_location_received = None

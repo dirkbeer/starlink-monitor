@@ -14,9 +14,12 @@ class LocationTests(unittest.TestCase):
         class Dish(rpc.DeviceServicer):
             response = pb.Response(get_location=pb.GetLocationResponse(lla=pb.LLAPosition(lat=0,lon=0)))
             deny = False
+            valid = True
             def Handle(self, request, context):
                 if self.deny:
                     context.abort(grpc.StatusCode.PERMISSION_DENIED,'not shared')
+                if request.WhichOneof('request') == 'get_status':
+                    return pb.Response(dish_get_status=pb.DishGetStatusResponse(gps_stats=pb.DishGpsStats(gps_valid=self.valid)))
                 assert request.WhichOneof('request') == 'get_location'
                 return self.response
         dish = Dish()
@@ -27,6 +30,8 @@ class LocationTests(unittest.TestCase):
             client = sd.StarlinkClient()
         try:
             self.assertEqual(client.get_location(),(0,0))
+            dish.valid = False
+            with self.assertRaises(ValueError): client.get_location()
             for response in (pb.Response(),pb.Response(get_location=pb.GetLocationResponse()),
                              pb.Response(get_location=pb.GetLocationResponse(lla=pb.LLAPosition(lat=float('nan')))),
                              pb.Response(get_location=pb.GetLocationResponse(lla=pb.LLAPosition(lat=91)))):
@@ -59,9 +64,10 @@ class LocationTests(unittest.TestCase):
         class Denied(grpc.RpcError):
             def code(self): return grpc.StatusCode.PERMISSION_DENIED
         client = Mock(); client.get_location.side_effect = Denied()
-        d._stop = Mock(); d._stop.is_set.side_effect = [False,True]
+        d._stop = Mock(); d._stop.is_set.side_effect = [False,False,True]
+        d._location_wake = Mock()
         with patch.object(sd,'StarlinkClient',return_value=client): d._location_loop()
-        d._stop.wait.assert_called_once_with(60)
+        d._location_wake.wait.assert_called_once_with(60)
         self.assertEqual(d._location_source,'none')
         d._logger.log.assert_not_called()
 
