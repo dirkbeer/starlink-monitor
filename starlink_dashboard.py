@@ -1744,7 +1744,8 @@ class Dashboard:
         self._location_wake = threading.Event()
         self._location_generation = 0
         self._dish_location_received = None
-        self._dish_location_message = "Dish location: waiting for connection"
+        self._dish_location_message = ("Manual location selected" if self._location_mode == "manual"
+                                       else "Dish location: waiting for connection")
         self._manual_location = load_saved_location()
         self._history_times = deque(maxlen=HIST_POINTS)
         self._recording_error = tk.StringVar(value="")
@@ -1839,9 +1840,17 @@ class Dashboard:
 
     def _report_event_error(self):
         now = time.monotonic()
-        if now >= getattr(self, "_next_event_error_log", 0):
-            self._next_event_error_log = now + 60
-            self.root.report_callback_exception(*sys.exc_info())
+        exception = sys.exc_info()
+        key = (exception[0], str(exception[1]))
+        recent = {key: until for key, until in getattr(self, "_event_error_limits", {}).items()
+                  if until > now}
+        if key not in recent:
+            # Bound diagnostic state while preserving the first report of a different error.
+            if len(recent) >= 64:
+                recent.pop(next(iter(recent)))
+            recent[key] = now + 60
+            self.root.report_callback_exception(*exception)
+        self._event_error_limits = recent
 
     def _on_toggle_sat(self):
         self._sat_generation += 1

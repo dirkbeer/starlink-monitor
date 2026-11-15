@@ -68,11 +68,17 @@ class FollowupTests(unittest.TestCase):
 
     def test_repeated_event_errors_are_rate_limited(self):
         d = dashboard(); d.root = Mock()
+        def report(error):
+            try: raise error
+            except Exception: d._report_event_error()
         with patch.object(sd.time,'monotonic',return_value=100):
-            for _ in range(100): d._report_event_error()
-        d.root.report_callback_exception.assert_called_once()
-        with patch.object(sd.time,'monotonic',return_value=161): d._report_event_error()
-        self.assertEqual(d.root.report_callback_exception.call_count,2)
+            for _ in range(100): report(ValueError('repeat'))
+            d.root.report_callback_exception.assert_called_once()
+            report(RuntimeError('different'))
+            report(ValueError('different message'))
+        self.assertEqual(d.root.report_callback_exception.call_count,3)
+        with patch.object(sd.time,'monotonic',return_value=161): report(ValueError('repeat'))
+        self.assertEqual(d.root.report_callback_exception.call_count,4)
 
     def test_csv_partial_write_rolls_back_before_next_row(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(sd.DataLogger,'DATA_DIR',Path(tmp)):
