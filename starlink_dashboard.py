@@ -14,6 +14,8 @@ import threading
 import subprocess
 import tempfile
 import struct
+import queue
+from monitor_core import finite, formatted, history_samples, longitude_delta, draw_segments
 import tkinter as tk
 from tkinter import ttk, font as tkfont
 from collections import deque
@@ -37,6 +39,8 @@ BOXCAR_N     = 100   # throughput mean = moving boxcar over the last 100 samples
 
 GPS_PORT = "COM10"
 GPS_BAUD = 9600
+GPS_MAX_AGE = 10.0
+EXTERNAL_SERVICES = os.environ.get("STARLINK_EXTERNAL_SERVICES", "0") == "1"
 
 # Optional "Likely satellite" TLE matching (detail window). Requires sgp4 + numpy.
 # Starlink schedules beams on a fixed 15 s grid: a dish re-selects the best
@@ -76,8 +80,12 @@ APP_DIR = _writable_base()
 # Proto generation (embedded .proto, compiled at first run)
 # ---------------------------------------------------------------------------
 
-PROTO_DIR = Path(tempfile.gettempdir()) / "starlink_proto"
+# Private per-process storage: never import executable files from a shared cache.
+_PROTO_TEMP = tempfile.TemporaryDirectory(prefix="starlink-proto-")
+PROTO_DIR = Path(_PROTO_TEMP.name)
 PROTO_FILE = PROTO_DIR / "starlink.proto"
+_PROTO_LOCK = threading.Lock()
+_PROTO_READY = False
 
 PROTO_SRC = r"""
 syntax = "proto3";
@@ -226,20 +234,18 @@ def ensure_proto_compiled():
         # pb2 modules were generated at build time and bundled; no protoc needed.
         sys.path.insert(0, str(_bundle_base()))
         return
-    PROTO_DIR.mkdir(exist_ok=True)
-    pb2_file = PROTO_DIR / "starlink_pb2.py"
-    existing = PROTO_FILE.read_text() if PROTO_FILE.exists() else ""
-    needs_compile = not pb2_file.exists() or existing.strip() != PROTO_SRC.strip()
-    PROTO_FILE.write_text(PROTO_SRC)
-    if needs_compile:
+    global _PROTO_READY
+    with _PROTO_LOCK:
+        if _PROTO_READY:
+            return
+        PROTO_DIR.mkdir(exist_ok=True)
+        PROTO_FILE.write_text(PROTO_SRC, encoding="utf-8")
         subprocess.check_call([
             sys.executable, "-m", "grpc_tools.protoc",
-            f"--proto_path={PROTO_DIR}",
-            f"--python_out={PROTO_DIR}",
-            f"--grpc_python_out={PROTO_DIR}",
-            str(PROTO_FILE),
-        ])
-    sys.path.insert(0, str(PROTO_DIR))
+            f"--proto_path={PROTO_DIR}", f"--python_out={PROTO_DIR}",
+            f"--grpc_python_out={PROTO_DIR}", str(PROTO_FILE)])
+        sys.path.insert(0, str(PROTO_DIR))
+        _PROTO_READY = True
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +260,11 @@ class StarlinkClient:
         ensure_proto_compiled()
         self.pb2 = importlib.import_module("starlink_pb2")
         self.pb2_grpc = importlib.import_module("starlink_pb2_grpc")
-        channel = grpc.insecure_channel(DISH_HOST)
-        self.stub = self.pb2_grpc.DeviceStub(channel)
+        self.channel = grpc.insecure_channel(DISH_HOST)
+        self.stub = self.pb2_grpc.DeviceStub(self.channel)
+
+    def close(self):
+        self.channel.close()
 
     def get_status(self):
         req = self.pb2.Request()
@@ -388,6 +397,8 @@ def copyable_label(parent, var, fg=TEXT, font=None, bg=CARD,
 
 def _nice_ticks(lo, hi, n=3):
     """Return n evenly-spaced round tick values covering [lo, hi]."""
+    if not finite(lo) or not finite(hi):
+        return []
     span = hi - lo or 1
     raw_step = span / n
     mag = 10 ** math.floor(math.log10(raw_step)) if raw_step > 0 else 1
@@ -413,10 +424,23 @@ class Sparkline(tk.Canvas):
         self.fmt = fmt
         self.y_init = y_init   # (lo, hi) preset range; used until buffer is full
         self.data: deque = deque(maxlen=maxlen)
+        self.times = deque(maxlen=maxlen)
         self.bind("<Configure>", lambda _: self._draw())
 
-    def push(self, value):
-        self.data.append(value)
+    def push(self, value, timestamp=None):
+        timestamp = time.time() if timestamp is None else timestamp
+        if self.times and timestamp - self.times[-1] > POLL_INTERVAL * 2.5:
+            self.data.append(None)
+            self.times.append(self.times[-1] + POLL_INTERVAL)
+        self.data.append(value if finite(value) else None)
+        self.times.append(timestamp)
+        self._draw()
+
+    def seed(self, values, timestamps):
+        self.data.clear()
+        self.times.clear()
+        self.data.extend(values)
+        self.times.extend(timestamps)
         self._draw()
 
     def _draw(self):
@@ -426,11 +450,14 @@ class Sparkline(tk.Canvas):
         if w < 2 or len(self.data) < 2:
             return
         vals = list(self.data)
+        valid = [v for v in vals if finite(v)]
+        if not valid:
+            return
         # Use preset range until the buffer fills, then auto-scale
         if self.y_init and len(self.data) < self.data.maxlen:
             lo, hi = self.y_init
         else:
-            lo, hi = min(vals), max(vals)
+            lo, hi = min(valid), max(valid)
             # Enforce a minimum visible range so a stable signal (e.g. SNR ≈ 19.2 dB)
             # doesn't appear as a frozen flat line.
             min_span = max(abs((lo + hi) / 2) * 0.10, 1.0)
@@ -464,7 +491,7 @@ class Sparkline(tk.Canvas):
 
         # X-axis time labels: show age of leftmost point and midpoint
         n_pts = len(vals)
-        total_s = n_pts * POLL_INTERVAL
+        total_s = max(1, self.times[-1] - self.times[0])
         for frac, anchor in ((0.0, "w"), (0.5, "center"), (1.0, "e")):
             age_s = total_s * (1.0 - frac)
             if age_s < 60:
@@ -476,12 +503,9 @@ class Sparkline(tk.Canvas):
                              font=F_TINY, anchor="n")
 
         # Data line
-        xs = [to_x(i, n_pts) for i in range(n_pts)]
-        ys = [to_y(v) for v in vals]
-        pts = []
-        for x, y in zip(xs, ys):
-            pts += [x, y]
-        self.create_line(*pts, fill=self.color, width=2, smooth=True)
+        points = [(LMARGIN + (t-self.times[0])/total_s*plot_w, to_y(v))
+                  if finite(v) else None for t, v in zip(self.times, vals)]
+        draw_segments(self, points, fill=self.color, width=2)
 
 
 # ---------------------------------------------------------------------------
@@ -529,12 +553,13 @@ class MetricCard:
                                unit=unit, fmt=fmt, y_init=spark_y_init)
         self.spark.pack(fill="x", padx=4, pady=4)
 
-    def update(self, value):
-        if value is None:
+    def update(self, value, timestamp=None):
+        if not finite(value):
+            self.spark.push(None, timestamp)
             self.val_var.set("--")
             return
         self.val_var.set(self.fmt.format(value))
-        self.spark.push(value)
+        self.spark.push(value, timestamp)
 
         color = GREEN
         if self.crit is not None:
@@ -640,8 +665,16 @@ class StatusBar:
 def fetch_geolocation():
     """Returns dict with lat, lon, city, region, country, isp or raises."""
     import urllib.request, json
-    with urllib.request.urlopen("http://ip-api.com/json?fields=lat,lon,city,regionName,country,isp,query", timeout=6) as r:
-        return json.loads(r.read())
+    with urllib.request.urlopen("https://ipwho.is/", timeout=6) as r:
+        d = json.loads(r.read())
+    if not d.get("success"):
+        raise ValueError("IP geolocation unavailable")
+    lat, lon = d.get("latitude"), d.get("longitude")
+    if not valid_coordinates(lat, lon):
+        raise ValueError("Invalid IP coordinates")
+    return dict(lat=lat, lon=lon, city=d.get("city", ""),
+                regionName=d.get("region", ""), country=d.get("country", ""),
+                isp=d.get("connection", {}).get("isp", ""), query=d.get("ip", ""))
 
 
 # (SectorChart was removed in the reflection-based proto correction: it rendered
@@ -757,11 +790,9 @@ class DataLogger:
 
     def _rotate(self):
         today = datetime.datetime.now(datetime.timezone.utc).date()
-        if today == self._date and self._fh:
+        if today == self._date and self._fh and not self._fh.closed:
             return
-        if self._fh:
-            self._fh.close()
-        self._date = today
+        # Commit state only after the replacement is ready.
         # Find a day-file that's either new or already uses the current schema, so
         # a column change (e.g. added likely_sat) never mixes widths within a file.
         base = f"starlink_{today.isoformat()}"
@@ -771,16 +802,27 @@ class DataLogger:
             suffix += 1
             path = self.DATA_DIR / f"{base}_{suffix}.csv"
         write_header = not path.exists()
-        self._fh  = open(path, "a", newline="", encoding="utf-8")
-        self._csv = csv.writer(self._fh)
-        if write_header:
-            self._csv.writerow(LOG_FIELDS)
-        self._fh.flush()
+        fh = open(path, "a", newline="", encoding="utf-8")
+        try:
+            writer = csv.writer(fh)
+            if write_header:
+                writer.writerow(LOG_FIELDS)
+            fh.flush()
+        except Exception:
+            fh.close()
+            raise
+        if self._fh:
+            self._fh.close()
+        self._fh, self._csv, self._date = fh, writer, today
 
     def log(self, row: dict):
-        self._rotate()
-        self._csv.writerow([row.get(f, "") for f in LOG_FIELDS])
-        self._fh.flush()
+        try:
+            self._rotate()
+            self._csv.writerow([row.get(f, "") for f in LOG_FIELDS])
+            self._fh.flush()
+        except (OSError, ValueError):
+            self.close()
+            raise
 
     def close(self):
         if self._fh:
@@ -862,7 +904,9 @@ class SatelliteMatcher:
         self._np = np
         self._names = names
         self._array = SatrecArray(recs)
-        return True, f"{len(recs)} satellites"
+        age = (time.time() - self.CACHE.stat().st_mtime) / 3600
+        stale = " — STALE cache" if age >= self.REFRESH_H else ""
+        return True, f"{len(recs)} satellites; cache {age:.1f}h old{stale}"
 
     def match(self, lat_deg, lon_deg, az_deg, el_deg, alt_m=0.0, when=None):
         """Return (name, separation_deg, sat_az, sat_el) of the closest satellite,
@@ -973,7 +1017,17 @@ class SatelliteMatcher:
         data = urllib.request.urlopen(req, timeout=30).read().decode()
         if len(data) < 100 or "\n1 " not in ("\n" + data):
             raise RuntimeError("empty/invalid TLE response")
-        self.CACHE.write_text(data, encoding="utf-8")
+        from sgp4.api import Satrec
+        lines = [line.strip() for line in data.splitlines() if line.strip()]
+        if len(lines) % 3:
+            raise ValueError("Incomplete TLE catalogue")
+        for i in range(0, len(lines), 3):
+            if not lines[i+1].startswith("1 ") or not lines[i+2].startswith("2 "):
+                raise ValueError("Malformed TLE catalogue")
+            rec = Satrec.twoline2rv(lines[i+1], lines[i+2])
+            if not finite(rec.no_kozai) or rec.no_kozai <= 0:
+                raise ValueError("Invalid TLE orbit")
+        atomic_write(self.CACHE, data)
 
     @staticmethod
     def _observer_ecef(lat_deg, lon_deg, h):
@@ -1070,19 +1124,13 @@ class SkyMapPanel:
         # (The old per-sector obstruction overlay was removed: it drew field 1028,
         #  which reflection shows is initialization_duration_seconds, not sector data.
         #  The real per-direction obstruction map is a separate get_obstruction_map call.)
-        self.show_obstr = tk.BooleanVar(value=False)
         tk.Label(ctl, textvariable=status_var, bg=CARD, fg=DIM, font=F_TINY,
                  anchor="e").pack(side="right")
         self.canvas = tk.Canvas(self.frame, bg="#0a0f16", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=6, pady=(2, 6))
         self.borders = None
         self._last = None
-        self._sectors = None      # latest 10 per-sector values, for the overlay
-        self._overlay_img = None  # keep a ref so Tk doesn't GC the PhotoImage
         self.canvas.bind("<Configure>", lambda e: self._redraw())
-
-    def set_sectors(self, vals):
-        self._sectors = vals
 
     def set_borders(self, rings):
         self.borders = rings
@@ -1140,7 +1188,7 @@ class SkyMapPanel:
 
         def proj(lat, lon):
             north = (lat - dish_lat) * 111.32
-            east = (lon - dish_lon) * 111.32 * coslat
+            east = longitude_delta(lon, dish_lon) * 111.32 * coslat
             x = cx + east * ppk
             y = cy - north * ppk
             # Guard against non-finite or absurd coordinates, which can throw a
@@ -1159,14 +1207,14 @@ class SkyMapPanel:
         # --- borders / coastlines (only rings overlapping the view) ---
         if self.borders:
             for lons, lats, bbox in self.borders:
-                if bbox[2] < vb[0] or bbox[0] > vb[2] or bbox[3] < vb[1] or bbox[1] > vb[3]:
+                if bbox[3] < vb[1] or bbox[1] > vb[3]:
                     continue
-                flat = []
+                previous = None
                 for lon, lat in zip(lons, lats):
-                    x, y = proj(lat, lon)
-                    flat.extend((x, y))
-                if len(flat) >= 4:
-                    c.create_line(*flat, fill="#2c3a4a", width=1)
+                    point = proj(lat, lon)
+                    if previous and abs(point[0] - previous[0]) < 180 * 111.32 * coslat * ppk:
+                        c.create_line(*previous, *point, fill="#2c3a4a", width=1)
+                    previous = point
 
         # --- lat/lon graticule ---
         step = 2 if (vb[2] - vb[0]) > 8 else 1
@@ -1182,8 +1230,6 @@ class SkyMapPanel:
             la += step
 
         # --- translucent per-sector obstruction overlay (drawn under the ring/sats) ---
-        if self.show_obstr.get() and self._sectors:
-            self._draw_obstruction(c, cx, cy, w, h, self.RING_KM * ppk)
 
         # --- reference ring ---
         rp = self.RING_KM * ppk
@@ -1234,63 +1280,6 @@ class SkyMapPanel:
             info += f" · boresight {baz:.0f}°az {bel:.0f}°el"
         c.create_text(8, 8, text=info, fill=DIM, font=F_TINY, anchor="nw")
 
-    # ------------------------------------------------------------------
-    # Prototype obstruction overlay
-    # ------------------------------------------------------------------
-    # The dish's per-sector map (field 1028) is azimuth-only and coarse (10 wedges
-    # of 36°). We render it as translucent red pie-wedges radiating from the dish:
-    # the lower a sector's value, the more likely that bearing is obstructed, so the
-    # redder/more opaque the wedge. NOTE the sector->azimuth alignment (sector 1 =
-    # north, clockwise) is an assumption; the elevation dimension is absent, so a
-    # wedge shades a whole bearing rather than a specific sky patch.
-    SECTOR_LO, SECTOR_HI = 20.0, 50.0   # same value scale as the per-sector chart
-    OBSTR_MAX_ALPHA = 90                # subtle: peak opacity out of 255
-
-    def _draw_obstruction(self, c, cx, cy, w, h, r_inner):
-        """Shade each azimuth sector as an annular wedge from r_inner out to the
-        edge - the outer band only, since obstructions live near the horizon (low
-        elevation = far from the dish). Inside r_inner (near-overhead) stays clear."""
-        vals = self._sectors
-        if not vals:
-            return
-        R = math.hypot(w, h)            # reach the corners
-        r_inner = max(8.0, r_inner)
-        lo, hi = self.SECTOR_LO, self.SECTOR_HI
-        try:
-            from PIL import Image, ImageDraw, ImageTk
-            img = Image.new("RGBA", (max(1, w), max(1, h)), (0, 0, 0, 0))
-            d = ImageDraw.Draw(img)                 # replaces pixels (incl. alpha)
-            drew = False
-            for i, val in enumerate(vals[:10]):
-                frac = max(0.0, min(1.0, (val - lo) / (hi - lo)))   # 1 clear, 0 blocked
-                obstr = 1.0 - frac
-                if obstr <= 0.05:
-                    continue
-                drew = True
-                az = i * 36.0
-                # compass az -> PIL angle (image y-down, 0=east, clockwise): az - 90
-                start = az - 18 - 90 + 360
-                a = int(8 + obstr * self.OBSTR_MAX_ALPHA)
-                d.pieslice([cx - R, cy - R, cx + R, cy + R], start, start + 36,
-                           fill=(248, 81, 73, a))
-            if drew:
-                # punch out the inner disc -> annulus (ImageDraw replaces alpha)
-                d.ellipse([cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner],
-                          fill=(0, 0, 0, 0))
-                self._overlay_img = ImageTk.PhotoImage(img)
-                c.create_image(0, 0, anchor="nw", image=self._overlay_img)
-        except Exception:
-            # zero-dependency fallback: stippled outer wedges (dithered transparency)
-            for i, val in enumerate(vals[:10]):
-                obstr = 1.0 - max(0.0, min(1.0, (vals[i] - lo) / (hi - lo)))
-                if obstr <= 0.1:
-                    continue
-                az = i * 36.0
-                c.create_arc(cx - R, cy - R, cx + R, cy + R,
-                             start=(90 - (az + 18)) % 360, extent=36,
-                             style="pieslice", outline="", fill=RED, stipple="gray12")
-
-
 LOCATION_FILE = APP_DIR / "location.json"
 
 def _load_config():
@@ -1301,14 +1290,33 @@ def _load_config():
     except Exception:
         return {}
 
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".starlink-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def valid_coordinates(lat, lon):
+    return (isinstance(lat, (float, int)) and isinstance(lon, (float, int))
+            and finite(lat) and finite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180)
+
+
 def _save_config(d):
     import json
-    LOCATION_FILE.write_text(json.dumps(d, indent=2))
+    atomic_write(LOCATION_FILE, json.dumps(d, indent=2))
 
 def load_saved_location():
     """Return (lat, lon, label) from disk, or (None, None, '')."""
     d = _load_config()
-    return d.get("lat"), d.get("lon"), d.get("label", "")
+    if not valid_coordinates(d.get("lat"), d.get("lon")):
+        return None, None, ""
+    return d["lat"], d["lon"], str(d.get("label", ""))
 
 def save_location(lat, lon, label=""):
     d = _load_config()
@@ -1339,7 +1347,7 @@ class LocationPanel:
         body.columnconfigure(1, weight=1, uniform="loc")
 
         # --- Ground station column ---
-        gs_hdr = tk.Label(body, text="Ground (IP)", bg=CARD, fg=ORANGE,
+        gs_hdr = tk.Label(body, text="Public IP", bg=CARD, fg=ORANGE,
                           font=F_SMALL, anchor="w")
         gs_hdr.grid(row=0, column=0, sticky="w", padx=6, pady=(2, 0))
 
@@ -1515,7 +1523,7 @@ class LocationPanel:
             return
         km = _haversine_km(self._dish_lat, self._dish_lon,
                            self._gs_lat, self._gs_lon)
-        self._dist_var.set(f"{km:.0f} km to ground station")
+        self._dist_var.set(f"{km:.0f} km to IP location")
 
 
 def list_serial_ports():
@@ -1530,15 +1538,19 @@ def list_serial_ports():
 
 def _nmea_to_deg(value, hemi):
     """Convert NMEA DDDMM.MMMM + hemisphere char to signed decimal degrees."""
-    if not value or not hemi:
+    if not value or hemi not in ("N", "S", "E", "W"):
         return None
     try:
         raw = float(value)
     except ValueError:
         return None
+    if not finite(raw) or raw < 0:
+        return None
     deg = int(raw / 100)
     minutes = raw - deg * 100
     result = deg + minutes / 60.0
+    if minutes >= 60 or result > (90 if hemi in ("N", "S") else 180):
+        return None
     if hemi in ("S", "W"):
         result = -result
     return result
@@ -1551,7 +1563,11 @@ class GpsReader:
         self._on_update = on_update  # callable(lat_or_None, lon_or_None, quality, num_sats)
         self._on_raw = on_raw        # callable(raw_nmea_line) for the live feed display
         self._stop = threading.Event()
-        self._sats_in_view = 0   # accumulated from GSV sentences
+        self._sats_in_view = 0
+        self._gsv = {}
+        self._last_gga = 0
+        self._gga_quality = 0
+        self._gga_sats = 0
         self._thread = threading.Thread(
             target=self._run, args=(port, baud), daemon=True, name="gps-reader")
         self._thread.start()
@@ -1576,9 +1592,9 @@ class GpsReader:
                             if self._on_raw and line.startswith("$"):
                                 self._on_raw(line)
                             self._parse(line)
-                        except Exception:
-                            pass
-            except Exception:
+                        except (ValueError, UnicodeError):
+                            continue
+            except (OSError, serial.SerialException):
                 # Port unavailable — retry after a pause
                 self._on_update(None, None, -2, 0)
                 self._stop.wait(5)
@@ -1586,7 +1602,16 @@ class GpsReader:
     def _parse(self, line):
         if not line.startswith("$") or "*" not in line:
             return
-        payload = line.split("*")[0]
+        payload, checksum = line[1:].rsplit("*", 1)
+        actual = 0
+        for char in payload:
+            actual ^= ord(char)
+        try:
+            if len(checksum) != 2 or actual != int(checksum, 16):
+                return
+        except ValueError:
+            return
+        payload = "$" + payload
         parts = payload.split(",")
         sentence = parts[0][1:]  # e.g. "GPGGA"
 
@@ -1596,11 +1621,13 @@ class GpsReader:
                 return
             quality = int(parts[6]) if parts[6].isdigit() else 0
             tracked = int(parts[7]) if parts[7].isdigit() else 0
-            # prefer GSV in-view count when available; fall back to tracked count
-            num_sats = self._sats_in_view if self._sats_in_view else tracked
+            # Fix satellite count is GGA tracked count, not GSV satellites in view.
+            num_sats = tracked
+            self._last_gga = time.monotonic()
+            self._gga_quality, self._gga_sats = quality, tracked
             lat = _nmea_to_deg(parts[2], parts[3])
             lon = _nmea_to_deg(parts[4], parts[5])
-            self._on_update(lat, lon, quality, num_sats)
+            self._on_update(lat, lon, quality if valid_coordinates(lat, lon) else 0, num_sats)
 
         elif sentence in ("GPRMC", "GNRMC", "GLRMC"):
             # $xxRMC,time,status,lat,NS,lon,EW,...
@@ -1609,16 +1636,20 @@ class GpsReader:
             status = parts[2]  # A=active, V=void
             lat = _nmea_to_deg(parts[3], parts[4])
             lon = _nmea_to_deg(parts[5], parts[6])
-            quality = 1 if status == "A" else 0
-            self._on_update(lat, lon, quality, self._sats_in_view)
+            recent_gga = time.monotonic() - self._last_gga < GPS_MAX_AGE
+            quality = (self._gga_quality if recent_gga else 1) if status == "A" else 0
+            self._on_update(lat, lon, quality if valid_coordinates(lat, lon) else 0,
+                            self._gga_sats if recent_gga else 0)
 
         elif sentence.endswith("GSV"):
             # $xxGSV,numMsg,msgNum,numSVsInView,...
-            # Accumulate total-in-view across all constellations; take the max seen
+            # Fresh per-talker counts; fix telemetry uses GGA tracked satellites.
             if len(parts) >= 4 and parts[3].isdigit():
                 count = int(parts[3])
-                if count > self._sats_in_view:
-                    self._sats_in_view = count
+                now = time.monotonic()
+                self._gsv[sentence[:2]] = (now, count)
+                self._gsv = {k: v for k, v in self._gsv.items() if now-v[0] < GPS_MAX_AGE}
+                self._sats_in_view = sum(v[1] for v in self._gsv.values())
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -1636,6 +1667,18 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 class Dashboard:
     def __init__(self, root: tk.Tk):
         self.root = root
+        self._stop = threading.Event()
+        self._events = queue.Queue()
+        self._last_usage_time = None
+        self._sat_loading = False
+        self._sat_refresh_at = 0
+        self._sat_generation = 0
+        self._gps_received = None
+        self._gps_generation = 0
+        self._location_source = "manual"
+        self._history_times = deque(maxlen=HIST_POINTS)
+        self._recording_error = tk.StringVar(value="")
+        root.after(100, self._drain_events)
         root.title("Starlink Monitor")
         root.configure(bg=BG)
         root.geometry("1200x820")
@@ -1666,10 +1709,12 @@ class Dashboard:
         self._last_sat_name = ""       # most recent likely-satellite match (for logging)
         self._last_sat_sep = ""
         self._border_map = BorderMap()  # coastline/state/country borders for the sky map
-        threading.Thread(target=self._load_borders, daemon=True).start()
+        if EXTERNAL_SERVICES:
+            threading.Thread(target=self._load_borders, daemon=True).start()
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
-        threading.Thread(target=self._fetch_location, daemon=True).start()
+        if EXTERNAL_SERVICES:
+            threading.Thread(target=self._fetch_location, daemon=True).start()
         # Restore saved dish location if present (GPS will override when it gets a fix)
         lat, lon, label = load_saved_location()
         if lat is not None:
@@ -1689,25 +1734,63 @@ class Dashboard:
     # ------------------------------------------------------------------
     # Optional "Likely satellite" TLE estimate
     # ------------------------------------------------------------------
-    def _on_toggle_sat(self):
-        self._sat_on = self._sat_enabled.get()
-        if not self._sat_on:
-            self._sat_status_var.set("")
-            self.detail_info.set("Likely Sat", "--", DIM)
+    def _post(self, callback, *args):
+        if not self._stop.is_set():
+            self._events.put((callback, args))
+
+    def _drain_events(self):
+        if self._stop.is_set():
             return
-        if self._sat_loaded:
-            self._sat_status_var.set("Sat: matching…")
-            self._sat_window_start = None   # force a match on next poll
-        else:
-            self._sat_status_var.set("Sat: loading TLE catalogue…")
+        for _ in range(200):
+            try:
+                callback, args = self._events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args)
+            except Exception:
+                self.root.report_callback_exception(*sys.exc_info())
+        self._expire_gps()
+        if self._sat_on and not self._sat_loading and time.monotonic() >= self._sat_refresh_at:
+            self._sat_loading = True
             threading.Thread(target=self._load_sat_tle, daemon=True).start()
+        self.root.after(100, self._drain_events)
+
+    def _on_toggle_sat(self):
+        self._sat_generation += 1
+        self._sat_on = self._sat_enabled.get()
+        self._last_sat_name, self._last_sat_sep = "", ""
+        self._sat_window_start = None
+        if not self._sat_on:
+            self._sat_status_var.set("Tracking disabled")
+            self.detail_info.set("Likely Sat", "--", DIM)
+            self.sky_map.update(None, None, None, None, None, None, None)
+        else:
+            self._sat_status_var.set("Sat: loading catalogue…")
+            self._sat_refresh_at = 0
 
     def _load_sat_tle(self):
-        ok, msg = self._sat_matcher.load()
-        self._sat_loaded = ok
-        self._sat_window_start = None
-        self.root.after(0, self._sat_status_var.set,
-                        f"TLE: {msg}" if ok else f"Sat unavailable — {msg}")
+        matcher = SatelliteMatcher()
+        try:
+            ok, msg = matcher.load()
+        except Exception as e:
+            ok, msg = False, str(e)[:100]
+        self._post(self._finish_sat_load, matcher, ok, msg)
+
+    def _finish_sat_load(self, matcher, ok, msg):
+        self._sat_loading = False
+        self._sat_refresh_at = time.monotonic() + (3600 if ok else 60)
+        if ok:
+            self._sat_matcher = matcher
+            self._sat_loaded = True
+            self._sat_window_start = None
+        self._tle_status = msg if ok else "Refresh failed; prior catalogue retained: " + msg
+        if self._sat_on:
+            self._sat_status_var.set(self._tle_status)
+
+    def _deliver_sat_match(self, generation, *args):
+        if generation == self._sat_generation and self._sat_on:
+            self._show_sat_match(*args)
 
     def _maybe_match_satellite(self):
         """Runs in the poll thread. The dish holds one satellite per 15 s handoff
@@ -1715,18 +1798,19 @@ class Dashboard:
         the countdown to the next handoff. Vectorised, never blocks the UI."""
         if not (self._sat_on and self._sat_loaded):
             return
+        generation = self._sat_generation
         now = datetime.datetime.now(datetime.timezone.utc)
         start, end = handoff_window(now)
         remain = (end - now).total_seconds()
         if self._sat_window_start == start:
             # still inside the current lock window: identity is unchanged, tick clock
-            self.root.after(0, self._update_handoff_countdown, remain)
+            self._post(self._update_handoff_countdown, remain)
             return
         bs = self._last_boresight
         lat = self.location_panel._dish_lat
         lon = self.location_panel._dish_lon
         if bs is None or lat is None or lon is None:
-            self.root.after(0, self._show_sat_match, None, "need GPS fix + pointing", remain)
+            self._post(self._deliver_sat_match, generation, None, "need GPS fix + pointing", remain)
             return
         self._sat_window_start = start
         try:
@@ -1734,23 +1818,28 @@ class Dashboard:
             # the result then stands for the remainder of this handoff window.
             res = self._sat_matcher.match(lat, lon, bs[1], bs[0], when=now)
         except Exception as e:
-            self.root.after(0, self._show_sat_match, None, str(e)[:40], remain)
+            self._post(self._deliver_sat_match, generation, None, str(e)[:40], remain)
             return
-        self.root.after(0, self._show_sat_match, res, None, remain)
+        self._post(self._deliver_sat_match, generation, res, None, remain)
 
     def _load_borders(self):
         ok, _msg = self._border_map.load()
         if ok:
-            self.root.after(0, self.sky_map.set_borders, self._border_map.rings)
+            self._post(self.sky_map.set_borders, self._border_map.rings)
+
+    def _deliver_sky_map(self, generation, *args):
+        if generation == self._sat_generation and self._sat_on:
+            self.sky_map.update(*args)
 
     def _update_sky_map(self):
         """Runs in the poll thread every cycle: snapshot all sats and redraw the map."""
         if not (self._sat_on and self._sat_loaded):
             return
+        generation = self._sat_generation
         lat = self.location_panel._dish_lat
         lon = self.location_panel._dish_lon
         if lat is None or lon is None:
-            self.root.after(0, self.sky_map.update, None, None, None, None, None, None)
+            self._post(self._deliver_sky_map, generation, None, None, None, None, None, None, None)
             return
         try:
             snap = self._sat_matcher.snapshot(lat, lon, min_el=20.0)
@@ -1759,7 +1848,7 @@ class Dashboard:
         bs = self._last_boresight
         baz = bs[1] if bs else None
         bel = bs[0] if bs else None
-        self.root.after(0, self.sky_map.update, lat, lon, snap,
+        self._post(self._deliver_sky_map, generation, lat, lon, snap,
                         self._last_sat_name, self._last_sat_sep, baz, bel)
 
     def _show_sat_match(self, res, err, remain=None):
@@ -1783,7 +1872,9 @@ class Dashboard:
     def _update_handoff_countdown(self, remain):
         """Append the live 'next handoff in N s' countdown to the sat status line.
         The dish may switch satellites when this reaches zero (or hold the same one)."""
-        base = self._sat_base_status
+        if not self._sat_on:
+            return
+        base = self._sat_base_status + " · " + getattr(self, "_tle_status", "")
         if base and remain is not None:
             self._sat_status_var.set(f"{base}  ·  next handoff in {remain:0.0f} s")
         elif base:
@@ -1791,24 +1882,61 @@ class Dashboard:
 
     def _reconnect_gps(self, port):
         save_gps_port(port)
+        self._gps_generation += 1
+        generation = self._gps_generation
         if self._gps_reader is not None:
             self._gps_reader.stop()
-        self._gps_reader = GpsReader(port, GPS_BAUD, self._on_gps_update,
-                                     on_raw=self._on_gps_raw)
+            self._gps_reader._thread.join(timeout=2.5)
+        self._apply_gps_update(None, None, 0, 0)
+        self._gps_reader = GpsReader(
+            port, GPS_BAUD,
+            lambda *args: self._post(self._deliver_gps, generation, *args),
+            on_raw=lambda line: self._post(self._deliver_raw, generation, line))
         self.location_panel.set_gps_connecting(port)
 
+    def _deliver_gps(self, generation, *args):
+        if generation == self._gps_generation:
+            self._apply_gps_update(*args)
+
+    def _deliver_raw(self, generation, line):
+        if generation == self._gps_generation:
+            self.location_panel.append_nmea(line)
+
     def _on_gps_update(self, lat, lon, quality, num_sats):
-        if lat is not None and quality > 0:
-            self._last_gps = {"lat": lat, "lon": lon,
-                              "sats": num_sats, "quality": quality}
-        self.root.after(0, self.location_panel.set_gps_status,
-                        lat, lon, quality, num_sats)
+        self._post(self._apply_gps_update, lat, lon, quality, num_sats)
+
+    def _apply_gps_update(self, lat, lon, quality, num_sats):
+        self._gps_received = time.monotonic()
+        valid = quality > 0 and valid_coordinates(lat, lon)
+        self._last_gps = {"lat": lat if valid else None, "lon": lon if valid else None,
+                          "sats": num_sats, "quality": quality if valid else 0}
+        if valid:
+            self._location_source = "gps"
+        elif self._location_source == "gps":
+            self.location_panel._dish_lat = self.location_panel._dish_lon = None
+            self._last_sat_name, self._last_sat_sep = "", ""
+            self._sat_generation += 1
+            self._sat_window_start = None
+        self.location_panel.set_gps_status(lat if valid else None, lon if valid else None,
+                                           quality, num_sats)
+
+    def _expire_gps(self):
+        if (self._gps_received is not None and self._last_gps.get("quality", 0) > 0
+                and time.monotonic() - self._gps_received > GPS_MAX_AGE):
+            self._apply_gps_update(None, None, 0, 0)
 
     def _on_gps_raw(self, line):
-        # Called from the GPS thread for each NMEA sentence; marshal to the UI thread.
-        self.root.after(0, self.location_panel.append_nmea, line)
+        self._post(self.location_panel.append_nmea, line)
 
     def _on_close(self):
+        self._stop.set()
+        if self._gps_reader is not None:
+            self._gps_reader.stop()
+        if self._client is not None:
+            self._client.close()
+        self._poll_thread.join(timeout=1)
+        if self._gps_reader is not None:
+            self._gps_reader._thread.join(timeout=2.5)
         self._logger.close()
         self.root.destroy()
 
@@ -1821,6 +1949,10 @@ class Dashboard:
         tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x")
 
         self.status_bar = StatusBar(self.root)
+        tk.Label(self.root, textvariable=self._recording_error, bg=BG,
+                 fg=RED, anchor="w").pack(fill="x", side="bottom")
+        tk.Button(self.root, text="Show details", command=lambda: self._detail.deiconify(),
+                  bg=CARD, fg=TEXT).pack(anchor="e")
 
         main = tk.Frame(self.root, bg=BG)
         main.pack(fill="both", expand=True, padx=10, pady=8)
@@ -1915,7 +2047,7 @@ class Dashboard:
 
         # Satellite sky map — replaces the old Sky Position + Dish Tilt panels,
         # spanning their two cells. (Tilt now shows as a value in Dish Info.)
-        self._sat_enabled = tk.BooleanVar(value=True)
+        self._sat_enabled = tk.BooleanVar(value=EXTERNAL_SERVICES)
         self._sat_status_var = tk.StringVar(value="")
         self.sky_map = SkyMapPanel(main, self._sat_enabled,
                                    self._on_toggle_sat, self._sat_status_var)
@@ -1949,7 +2081,7 @@ class Dashboard:
                     geo.get("isp", "--"),
                     geo.get("query", "--"),
                 )
-            self.root.after(0, apply)
+            self._post(apply)
         except Exception:
             pass
 
@@ -2000,7 +2132,9 @@ class Dashboard:
                 return
             label = entries["label"].get().strip()
             save_location(lat, lon, label)
+            self._location_source = "manual"
             self.location_panel.set_dish_location(lat, lon, label)
+            self._sat_window_start = None
             dlg.destroy()
 
         btn_frame = tk.Frame(dlg, bg=BG)
@@ -2018,63 +2152,62 @@ class Dashboard:
 
     def _poll_loop(self):
         first = True
-        while True:
+        deadline = time.monotonic()
+        while not self._stop.is_set():
             try:
                 self._connect()
                 if first:
                     first = False
-                    hist = self._client.get_history()
-                    self.root.after(0, self._seed_history, hist)
+                    try:
+                        hist = self._client.get_history()
+                        self._post(self._seed_history, hist, time.time())
+                    except Exception:
+                        pass  # Current telemetry remains useful without history.
                 status = self._client.get_status()
-                self.root.after(0, self._apply_status, status)
+                self._post(self._apply_status, status, time.time())
                 self._maybe_match_satellite()
                 self._error_count = 0
             except Exception as e:
                 self._error_count += 1
+                if self._client is not None:
+                    self._client.close()
                 self._client = None
-                first = True  # re-seed on reconnect
-                msg = str(e)[:80]
-                self.root.after(0, self.status_bar.update, False,
-                                f"Error ({self._error_count}): {msg}")
-            # Sky map runs on TLE + GPS, independent of the dish gRPC link, so it
-            # keeps moving even while the dish is briefly unreachable. Guarded in its
-            # own try so a bad frame here can never kill the poll thread.
+                first = True
+                self._post(self.status_bar.update, False,
+                           f"Error ({self._error_count}): {str(e)[:80]}")
             try:
                 self._update_sky_map()
-            except Exception as e:
-                self.root.after(0, self.status_bar.update, True,
-                                f"sky map skipped: {str(e)[:60]}")
-            time.sleep(POLL_INTERVAL)
+            except Exception:
+                pass  # Ancillary failures must not change connection health.
+            deadline += POLL_INTERVAL
+            if deadline <= time.monotonic():
+                deadline = time.monotonic() + POLL_INTERVAL
+            self._stop.wait(max(0, deadline-time.monotonic()))
 
-    def _seed_history(self, h):
-        """Pre-populate sparklines from the dish's onboard 900-second history buffer.
-
-        Only drop/latency/throughput are seeded. History field 1010 is power_in
-        (watts), not a link-quality metric, so it is not seeded into any card.
-        """
-        dl  = [v / 1e6 for v in h.downlink_throughput_bps]
-        ul  = [v / 1e6 for v in h.uplink_throughput_bps]
-        lat = list(h.pop_ping_latency_ms)
-        drop = [v * 100 for v in h.pop_ping_drop_rate]
-
-        for v in lat:  self.card_latency.spark.push(v)
-        for v in drop: self.card_drop.spark.push(v)
-        for v in dl:   self.card_dl.spark.push(v)
-        for v in ul:   self.card_ul.spark.push(v)
-
-        # Seeded data is 1 Hz; live polls are every POLL_INTERVAL seconds.
-        # Downsample so each stored point represents the same time step as live data,
-        # keeping the X-axis scale consistent and the 20-min window accurate.
-        self._dl_history.extend(dl[::POLL_INTERVAL])
-        self._ul_history.extend(ul[::POLL_INTERVAL])
+    def _seed_history(self, h, timestamp=None):
+        rows = history_samples(h, POLL_INTERVAL, time.time() if timestamp is None else timestamp)
+        if not rows:
+            return
+        times, dl, ul, latency, drop = map(list, zip(*rows))
+        for card, values in ((self.card_latency, latency), (self.card_drop, drop),
+                             (self.card_dl, dl), (self.card_ul, ul)):
+            card.spark.seed(values, times)
+        self._history_times.clear()
+        self._history_times.extend(times)
+        self._dl_history.clear()
+        self._ul_history.clear()
+        self._dl_history.extend(dl)
+        self._ul_history.extend(ul)
         self._draw_history()
 
-    def _apply_status(self, s):
+    def _apply_status(self, s, timestamp=None):
+        timestamp = time.time() if timestamp is None else timestamp
+        self._expire_gps()
         dl = s.downlink_throughput_bps / 1e6
         ul = s.uplink_throughput_bps / 1e6
         el = s.boresight_elevation_deg
         az = s.boresight_azimuth_deg
-        self._last_boresight = (el, az)   # consumed by optional TLE sat matcher
+        self._last_boresight = (el, az) if finite(el) and finite(az) else None   # consumed by optional TLE sat matcher
 
         obstr = s.obstruction_stats
         frac_obstr = obstr.fraction_obstructed * 100.0        # -> percent
@@ -2083,11 +2216,11 @@ class Dashboard:
         gps = s.gps_stats
 
         # Main window metrics
-        self.card_latency.update(s.pop_ping_latency_ms)
-        self.card_drop.update(s.pop_ping_drop_rate * 100)
-        self.card_dl.update(dl)
-        self.card_ul.update(ul)
-        self.card_obstr.update(frac_obstr)
+        self.card_latency.update(s.pop_ping_latency_ms, timestamp)
+        self.card_drop.update(s.pop_ping_drop_rate * 100, timestamp)
+        self.card_dl.update(dl, timestamp)
+        self.card_ul.update(ul, timestamp)
+        self.card_obstr.update(frac_obstr, timestamp)
 
         di = s.device_info
         ds = s.device_state
@@ -2097,14 +2230,17 @@ class Dashboard:
         self.info_panel.set("Hardware", di.hardware_version)
         self.info_panel.set_firmware(di.software_version, KNOWN_FIRMWARE)
         self.info_panel.set("Uptime", f"{uptime_h}h {uptime_m}m")
-        self._cum_dl_gb += dl * POLL_INTERVAL / 8 / 1e3  # Mbps × s → MB → GB
-        self._cum_ul_gb += ul * POLL_INTERVAL / 8 / 1e3
+        elapsed = 0 if self._last_usage_time is None else timestamp-self._last_usage_time
+        self._last_usage_time = timestamp
+        if 0 < elapsed <= POLL_INTERVAL * 2.5:
+            if finite(dl): self._cum_dl_gb += dl * elapsed / 8 / 1e3
+            if finite(ul): self._cum_ul_gb += ul * elapsed / 8 / 1e3
         cum_total = self._cum_dl_gb + self._cum_ul_gb
         if cum_total < 1.0:
             usage_str = f"↓{self._cum_dl_gb*1e3:.0f} ↑{self._cum_ul_gb*1e3:.0f} MB"
         else:
             usage_str = f"↓{self._cum_dl_gb:.2f} ↑{self._cum_ul_gb:.2f} GB"
-        self.info_panel.set("Usage", usage_str)
+        self.info_panel.set("Usage", "~" + usage_str)
 
         # Status panel — real obstruction fraction, GPS fix, and signal-vs-noise-floor.
         self.status_panel.set("Obstructed", "Yes" if obstructed else "No",
@@ -2123,15 +2259,20 @@ class Dashboard:
         self.status_panel.set("Uptime", f"{uptime_h}h {uptime_m}m")
         self.status_panel.set("Firmware", di.software_version)
 
-        self._dl_history.append(dl)
-        self._ul_history.append(ul)
+        if self._history_times and timestamp-self._history_times[-1] > POLL_INTERVAL * 2.5:
+            self._history_times.append(self._history_times[-1] + POLL_INTERVAL)
+            self._dl_history.append(None)
+            self._ul_history.append(None)
+        self._history_times.append(timestamp)
+        self._dl_history.append(dl if finite(dl) else None)
+        self._ul_history.append(ul if finite(ul) else None)
         self._draw_history()
 
         # Dish tilt from the NED->dish orientation quaternion (q_scalar,q_x,q_y,q_z).
         q = s.ned2dish_quaternion
         w, x, y, z = q.q_scalar, q.q_x, q.q_y, q.q_z
         tilt_log = ""
-        if abs(w) > 0.01 or abs(x) > 0.01:
+        if all(finite(v) for v in (w,x,y,z)) and (abs(w) > 0.01 or abs(x) > 0.01):
             rz = w*w - x*x - y*y + z*z
             tilt_deg = math.degrees(math.acos(max(-1.0, min(1.0, rz))))
             self.info_panel.set("Tilt", f"{tilt_deg:.1f}° from vertical")
@@ -2163,37 +2304,41 @@ class Dashboard:
 
         # --- Data logging ---
         gps_nmea = self._last_gps
-        self._logger.log({
-            "timestamp_utc":       datetime.datetime.now(datetime.timezone.utc)
-                                   .strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "dl_mbps":             f"{dl:.3f}",
-            "ul_mbps":             f"{ul:.3f}",
-            "latency_ms":          f"{s.pop_ping_latency_ms:.1f}",
-            "drop_pct":            f"{s.pop_ping_drop_rate * 100:.4f}",
-            "obstruction_pct":     f"{frac_obstr:.4f}",
-            "currently_obstructed": 1 if obstructed else 0,
-            "boresight_el_deg":    f"{el:.2f}",
-            "boresight_az_deg":    f"{az:.2f}",
-            "tilt_deg":            tilt_log,
-            "snr_above_noise_floor": 1 if snr_ok else 0,
-            "eth_mbps":            s.eth_speed_mbps,
-            "uptime_s":            s.device_state.uptime_s,
-            "dish_gps_valid":      1 if gps.gps_valid else 0,
-            "dish_gps_sats":       gps.gps_sats,
-            "attitude_uncertainty_deg": f"{al.attitude_uncertainty_deg:.4f}",
-            "desired_el_deg":      f"{al.desired_boresight_elevation_deg:.2f}",
-            "desired_az_deg":      f"{al.desired_boresight_azimuth_deg:.2f}",
-            "gps_lat":             f"{gps_nmea['lat']:.6f}" if gps_nmea.get("lat") else "",
-            "gps_lon":             f"{gps_nmea['lon']:.6f}" if gps_nmea.get("lon") else "",
-            "gps_sats":            gps_nmea.get("sats", ""),
-            "gps_quality":         gps_nmea.get("quality", ""),
-            "firmware":            di.software_version,
-            "country":             di.country_code,
-            "cum_dl_gb":           f"{self._cum_dl_gb:.6f}",
-            "cum_ul_gb":           f"{self._cum_ul_gb:.6f}",
-            "likely_sat":          self._last_sat_name,
-            "likely_sat_sep_deg":  self._last_sat_sep,
-        })
+        try:
+            self._logger.log({
+                "timestamp_utc":       datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
+                                       .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "dl_mbps":             formatted(dl, ".3f"),
+                "ul_mbps":             formatted(ul, ".3f"),
+                "latency_ms":          formatted(s.pop_ping_latency_ms, ".1f"),
+                "drop_pct":            formatted(s.pop_ping_drop_rate * 100, ".4f"),
+                "obstruction_pct":     formatted(frac_obstr, ".4f"),
+                "currently_obstructed": 1 if obstructed else 0,
+                "boresight_el_deg":    formatted(el, ".2f"),
+                "boresight_az_deg":    formatted(az, ".2f"),
+                "tilt_deg":            tilt_log,
+                "snr_above_noise_floor": 1 if snr_ok else 0,
+                "eth_mbps":            s.eth_speed_mbps,
+                "uptime_s":            s.device_state.uptime_s,
+                "dish_gps_valid":      1 if gps.gps_valid else 0,
+                "dish_gps_sats":       gps.gps_sats,
+                "attitude_uncertainty_deg": formatted(al.attitude_uncertainty_deg, ".4f"),
+                "desired_el_deg":      formatted(al.desired_boresight_elevation_deg, ".2f"),
+                "desired_az_deg":      formatted(al.desired_boresight_azimuth_deg, ".2f"),
+                "gps_lat":             formatted(gps_nmea['lat'], ".6f") if gps_nmea.get("lat") is not None else "",
+                "gps_lon":             formatted(gps_nmea['lon'], ".6f") if gps_nmea.get("lon") is not None else "",
+                "gps_sats":            gps_nmea.get("sats", ""),
+                "gps_quality":         gps_nmea.get("quality", ""),
+                "firmware":            di.software_version,
+                "country":             di.country_code,
+                "cum_dl_gb":           formatted(self._cum_dl_gb, ".6f"),
+                "cum_ul_gb":           formatted(self._cum_ul_gb, ".6f"),
+                "likely_sat":          self._last_sat_name,
+                "likely_sat_sep_deg":  self._last_sat_sep,
+            })
+            self._recording_error.set("")
+        except (OSError, ValueError) as e:
+            self._recording_error.set(f"NOT RECORDING: {e}")
 
     def _draw_history(self):
         c = self.hist_canvas
@@ -2203,7 +2348,7 @@ class Dashboard:
         if w < 4 or h < 4:
             return
 
-        all_vals = list(self._dl_history) + list(self._ul_history)
+        all_vals = [v for v in list(self._dl_history) + list(self._ul_history) if finite(v)]
         lo = 0
         hi = max(all_vals) if all_vals else 1
         if hi == lo:
@@ -2240,7 +2385,7 @@ class Dashboard:
         # X-axis time labels — each stored point is POLL_INTERVAL seconds apart;
         # cap at HIST_POINTS * POLL_INTERVAL so the scale never exceeds 20 min.
         n_pts = max(len(self._dl_history), len(self._ul_history))
-        total_s = min(n_pts * POLL_INTERVAL, HIST_POINTS * POLL_INTERVAL)
+        total_s = max(1, self._history_times[-1]-self._history_times[0]) if self._history_times else 1
         for frac, anchor in ((0.0, "w"), (0.25, "center"), (0.5, "center"),
                               (0.75, "center"), (1.0, "e")):
             age_s = total_s * (1.0 - frac)
@@ -2259,12 +2404,9 @@ class Dashboard:
             if len(data) < 2:
                 return
             vals = list(data)
-            xs = [to_x(i, len(vals)) for i in range(len(vals))]
-            ys = [to_y(v) for v in vals]
-            pts = []
-            for x, y in zip(xs, ys):
-                pts += [x, y]
-            c.create_line(*pts, fill=color, width=2, smooth=True)
+            points = [(LMARGIN+(t-self._history_times[0])/total_s*plot_w, to_y(v))
+                      if finite(v) else None for t,v in zip(self._history_times, vals)]
+            draw_segments(c, points, fill=color, width=2)
 
         draw_series(self._dl_history, BLUE)
         draw_series(self._ul_history, PURPLE)
@@ -2280,8 +2422,8 @@ class Dashboard:
 
         # Moving boxcar mean over the most recent BOXCAR_N samples
         if self._dl_history or self._ul_history:
-            dl_box = list(self._dl_history)[-BOXCAR_N:]
-            ul_box = list(self._ul_history)[-BOXCAR_N:]
+            dl_box = [v for v in list(self._dl_history)[-BOXCAR_N:] if finite(v)]
+            ul_box = [v for v in list(self._ul_history)[-BOXCAR_N:] if finite(v)]
             dl_mean = sum(dl_box) / len(dl_box) if dl_box else 0.0
             ul_mean = sum(ul_box) / len(ul_box) if ul_box else 0.0
             self._avg_dl_var.set(f"↓ {dl_mean:.1f}")

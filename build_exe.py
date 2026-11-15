@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a standalone Windows .exe of the Starlink dashboard with PyInstaller.
+"""Build a standalone Linux executable of the Starlink dashboard with PyInstaller.
 
 Why this script exists: the app normally compiles its embedded protobuf at first
 run by invoking ``python -m grpc_tools.protoc``. A frozen .exe has no interpreter
@@ -13,7 +13,7 @@ Usage:
     python build_exe.py --onedir    # folder build instead of one file (faster launch)
 
 Requires: pip install pyinstaller   (the app's own runtime deps must already be
-installed in the same interpreter). Run it with the SAME python you run the app
+installed in the same interpreter). Linux builds are validated in CI. Run it with the SAME python you run the app
 with, so the frozen build matches the tested environment.
 """
 import argparse
@@ -91,14 +91,14 @@ def build(console=False, onedir=False):
            "--console" if console else "--windowed",
            str(APP)]
     run(cmd)
-    out = ROOT / "dist" / (NAME if onedir else NAME + ".exe")
+    out = ROOT / "dist" / (NAME if onedir else NAME + (".exe" if sys.platform.startswith("win") else ""))
     print("\nBuilt:", out)
     print("Writable files (data/, location.json) are created next to the exe on"
           " first run.")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build StarlinkMonitor.exe")
+    ap = argparse.ArgumentParser(description="Build StarlinkMonitor")
     ap.add_argument("--console", action="store_true",
                     help="keep a console window for startup/debug output")
     ap.add_argument("--onedir", action="store_true",
