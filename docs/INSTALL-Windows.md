@@ -86,13 +86,13 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 This installs `grpcio` + `grpcio-tools` + `pyserial` (required) and `sgp4` + `numpy`
-+ `Pillow` (the satellite sky map and smooth obstruction overlay).
+(the optional satellite sky map).
 
 ### 5. Run it
 ```powershell
 python starlink_dashboard.py
 ```
-The embedded protobuf compiles automatically on first run - there is no separate
+The embedded protobuf compiles automatically in a private directory on each process launch - there is no separate
 `protoc` step. `data\` and `location.json` are created in the project folder.
 
 ### 6. (Optional) Rebuild the standalone exe
@@ -125,3 +125,29 @@ for the `--console` and `--onedir` options.
 | No dish data | Machine is not on the Starlink network, or the dish is unreachable at `192.168.100.1`. |
 | Firmware-mismatch banner (amber) | Expected after the dish updates itself. The app keeps running; see the README for promoting the new build to "known". |
 | Sky map is empty | From source: `sgp4`/`numpy` not installed. Either build: no GPS fix and no manual location set yet. |
+
+## Reliability updates and validation
+
+External lookups are disabled by default. Checking **Track satellites (TLE)** opts
+into catalogue downloads. For optional HTTPS public-IP geolocation and map data,
+set `$env:STARLINK_EXTERNAL_SERVICES = "1"` in PowerShell before launching.
+IP location is approximate; it does not establish a physical ground-station
+location. Fixes older than ten seconds are invalidated. Red **NOT RECORDING**
+text means CSV writes are failing even if the dish is connected.
+
+To run the developer checks on Windows:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+python tests/integration.py
+python build_exe.py --onedir
+python tests/smoke_build.py dist/StarlinkMonitor/StarlinkMonitor.exe
+python build_exe.py
+python tests/smoke_build.py dist/StarlinkMonitor.exe
+```
+
+The GUI test uses local gRPC and a pyserial loopback fixture on Windows; it does
+not require a physical COM port. A receiver unplug/replug check still needs real
+hardware. Native Windows CI is configured but its results are pending. Wine
+checks are supplementary and do not establish native Windows compatibility.

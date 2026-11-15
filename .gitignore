@@ -46,3 +46,7 @@ project-knowledge/
 
 # Office temp/lock files
 ~$*
+
+# Local review evidence and GUI test output
+review/
+tests/runtime-artifacts/

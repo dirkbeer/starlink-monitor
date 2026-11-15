@@ -2,7 +2,57 @@
 
 A standalone Python GUI dashboard for monitoring a Starlink dish in real time.
 It connects directly to the dish's **local gRPC API** — no Starlink app, SpaceX
-login, or internet account required. Everything stays on your LAN.
+login, or internet account required. By default only the local dish and local serial receiver are accessed. Optional external services require opt-in.
+
+
+## Reliability and validation
+
+This version repairs telemetry history, GPS validity, logging recovery, and the other
+issues identified in the repository review. Linux is validated locally. Windows regression, GUI, and packaging checks are also
+configured in CI; native Windows validation is pending.
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python starlink_dashboard.py
+```
+
+Install your distribution's Tk package if `import tkinter` fails (for example,
+`python3-tk` on Ubuntu or `tk` on Arch). A Starlink dish is needed for live data.
+The GUI continues running and reports connection errors when it is unavailable.
+
+External requests are disabled by default. The satellite checkbox explicitly
+opts into CelesTrak downloads. To also enable HTTPS public-IP geolocation
+(ipwho.is) and Natural Earth map downloads, launch with:
+
+```bash
+STARLINK_EXTERNAL_SERVICES=1 .venv/bin/python starlink_dashboard.py
+```
+
+Public-IP location is approximate and does not identify a physical Starlink ground
+station. Disabling satellite tracking clears its display and CSV estimate. TLE
+caches are checked hourly, refreshed after eight hours, and labeled when stale.
+
+Charts use measured timestamps and leave gaps for unavailable values. Seeded dish
+history is unwrapped and replaces overlapping samples on reconnect. Usage marked
+`~` is an estimate from observed throughput and measured elapsed time; long gaps
+are excluded, so it is not a billing or complete-traffic counter. GPS fixes expire
+after ten seconds of silence; invalid/stale fixes are not logged as valid.
+Recording failures appear in a persistent red `NOT RECORDING` indicator and retry
+on subsequent samples. Missing numeric measurements are blank in the CSV.
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m unittest discover -s tests -v
+xvfb-run -a .venv/bin/python tests/integration.py
+.venv/bin/python build_exe.py --onedir --console
+./dist/StarlinkMonitor/StarlinkMonitor
+```
+
+The integration test uses local gRPC, pseudo-terminal GPS, synthetic orbital data,
+and temporary CSV output; no dish or internet access is needed. CI is configured for Linux and Windows on Python 3.11 and 3.14 and builds
+platform-native executables. See
+[review guidance](docs/INDEPENDENT-REVIEW.md) for independent verification.
 
 ![Main window](docs/screenshot-main.png)
 
@@ -18,14 +68,14 @@ optional "likely satellite" estimate:
 **Main window**
 - Live metric cards with sparklines: ping latency, packet loss, download, upload,
   obstruction %
-- Throughput history chart (download + upload overlaid, 20-minute window)
+- Throughput history chart (download + upload overlaid, up to 20-minute sample window)
   with a **100-sample moving-boxcar mean** for each stream
 - **Status panel:** currently-obstructed + obstruction fraction, GPS fix (valid +
   sat count), Ethernet speed, boresight elevation/azimuth, signal vs noise floor,
   uptime, firmware
 - **Location panel** (two columns):
-  - *Ground (IP)* — approximate ground-station/PoP location from public IP geolocation
-  - *Dish (GPS)* — live dish position from an NMEA GPS receiver or manually-set coordinates
+  - *Public IP* — approximate ground-station/PoP location from public IP geolocation
+  - *Dish location* — built-in dish coordinates when available, with manual coordinates or an optional external GPS
   - Haversine distance between dish and ground station
   - COM-port selector (auto-detect, remembers last port) and Connect / Set-Manual controls
   - **Live 5-line NMEA feed** — the raw serial sentences, auto-scrolling
@@ -47,7 +97,7 @@ optional "likely satellite" estimate:
   and dish tilt from vertical (moved here from the old gauge)
 - Extended info — country, GPS fix + satellite count, the dish's desired (target)
   boresight, attitude uncertainty, obstruction fraction, IDs, router
-- **Likely satellite estimate** — *on by default* (toggle via the checkbox in the
+- **Likely satellite estimate** — *off by default* (toggle via the checkbox in the
   Satellite Sky Map panel). Downloads the public Starlink TLE catalogue from CelesTrak,
   propagates every satellite with SGP4, and reports whichever currently sits
   closest to the dish's reported boresight, with the angular offset (Δ). Needs a
@@ -79,8 +129,11 @@ optional "likely satellite" estimate:
    ```bash
    pip install -r requirements.txt
    ```
-4. **(Optional) Plug in a USB GPS** receiver that emits NMEA 0183 at 9600 baud and
-   note its COM port.
+4. **No extra GPS is required.** The app tries the dish's own location automatically.
+   For a stationary installation, use **Set Manual…** if the dish does not share
+   coordinates. Monitoring connection quality works without any location.
+   An optional NMEA receiver is useful for a moving installation; select its port
+   and click **Use external GPS** to connect it.
 5. **Run it:**
    ```bash
    python starlink_dashboard.py
@@ -122,7 +175,7 @@ Notes:
   `%TEMP%` on every launch, which is slow from a memory card; `--onedir` (distribute
   the whole `dist/StarlinkMonitor/` folder, e.g. zipped) launches faster.
 - Build with the **same Python** you run the app with, so the frozen build matches
-  the tested environment. The optional `sgp4`/`numpy`/`Pillow` packages are bundled
+  the tested environment. The optional `sgp4`/`numpy` packages are bundled
   automatically when present, so the satellite sky map works in the exe.
 
 ---
@@ -171,7 +224,7 @@ The selected GPS port and any manually-entered dish coordinates are saved to
   `get_history` requests.
 - **Schema.** The protobuf definitions live as a `PROTO_SRC` string inside
   `starlink_dashboard.py` and are compiled at runtime with `grpcio-tools` into a
-  temp directory — so updating a field is a one-line edit, no build step.
+  private per-process temp directory — so updating a field is a one-line edit, no build step.
 - **The schema is now taken from the dish's own gRPC server reflection**
   (firmware `2026.08.10.cr84226`), which is authoritative — not the earlier
   reverse-engineered guesses. The dish answers `grpc.reflection`, so you can dump
@@ -196,14 +249,28 @@ The selected GPS port and any manually-entered dish coordinates are saved to
     correctly the boresight sits ~1° from a real satellite (vs. an impossible ~178°
     "elevation" and an incoherent satellite match before). This also fixed the
     "Likely satellite" estimate, which had been fed the bad elevation.
-- **GPS position** (lat/lon) needs the `get_location` request, which returns
-  `PERMISSION_DENIED` unless enabled on the dish. GPS **fix status** (valid, sat
-  count, filter convergence) is always available via `gps_stats`.
+- **Dish location:** the app tries the local `get_location` API on a separate
+  connection, without delaying telemetry. Access depends on firmware/service plan;
+  [starlink-grpc-tools reports](https://github.com/sparky8512/starlink-grpc-tools#enabling-access-to-location-data)
+  that most plans stopped exposing coordinates in May 2026. Denied/unsupported
+  requests retry after 60 seconds; **Use dish location** retries immediately.
+  Transient failures retain the last fix for up to 10 seconds. Denied access or
+  expired coordinates fall back to saved manual coordinates, or leave location
+  blank. An entirely default 0°, 0°, 0 m response also needs a valid dish GPS
+  status, since omitted numeric fields cannot be distinguished from real zeroes.
+  No dish settings are changed.
+- **Location controls:** **Set Manual…** selects a fixed position;
+  **Use dish location** restores automatic lookup and stops the external receiver.
+  The selected mode is remembered across restarts. New installations default to
+  dish lookup; older configurations with a saved GPS port keep connecting that
+  receiver automatically. **Use external GPS** selects and remembers that mode.
+  CSV `location_source`, `location_lat`, and `location_lon` describe the selected
+  position; existing `gps_*` columns still describe only the external receiver.
+  The new header rotates existing logs to a numbered file without modifying them.
 - **GPS.** NMEA sentences are read on a background thread; `$xxGGA` gives fix
-  quality + satellite count, `$xxRMC` gives the A/V status, and `*GSV` provides the
-  in-view count. A fix auto-populates the dish coordinates.
-- **IP geolocation** (via `ip-api.com`) resolves to the Starlink ground
-  station / PoP, not the dish's physical location — this is expected.
+  quality + satellite count, `$xxRMC` gives the A/V status, and GGA supplies the number of satellites used in the fix.
+  A valid `*hh` checksum is required; checksum-less or corrupted sentences are ignored. A fix auto-populates the dish coordinates.
+- **IP geolocation** (via opt-in HTTPS `ipwho.is`) is only an approximate public-IP location; it does not identify the dish or a ground station.
 - **Firmware check.** On the first poll the dish's reported firmware is compared
   against `KNOWN_FIRMWARE` (the build the field numbers were verified against). On
   a match the Dish Info panel shows the version in green; on a mismatch it turns
@@ -234,3 +301,19 @@ The fastest way to re-verify and adapt:
 This tool talks only to your own dish on your local network; it does not contact
 SpaceX servers. Field numbers are empirical and may change with firmware. Use at
 your own risk.
+
+### Diagnostic commands
+
+`python starlink_dashboard.py --dish-host HOST:PORT` overrides the local dish
+endpoint (normally `192.168.100.1:9200`). `--selftest result.json` performs status
+and history RPCs, writes a JSON result, and exits without opening the GUI. It
+returns a nonzero exit code if the check fails. These options also work with the
+packaged executable. The self-test does not verify physical location access.
+
+Dish coordinates, when available and selected, are written automatically to CSV.
+The selected-location fields are appended after the existing columns. Logs stay
+on this computer; treat them as location data when sharing diagnostics.
+
+Catalogue downloads must contain at least 50 valid records and must retain at
+least half of a previously cached catalogue of 100 or more records. Rejected
+downloads leave the prior cache and its age unchanged.
