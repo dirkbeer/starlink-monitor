@@ -1,3 +1,5 @@
+> Historical upstream document: the numeric SNR and per-sector interpretations described here were later corrected. See the current README and embedded protocol schema. This narrative is not validation evidence for this fork.
+
 # Reverse-Engineering a Starlink Dish by Conversation - One-Page Summary
 
 **Artifact:** `starlink-monitor` - <https://github.com/AndyMcLeod/starlink-monitor> (MIT, releases v1.0.0–v1.0.7)

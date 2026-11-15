@@ -1,3 +1,5 @@
+> Historical upstream document: the numeric SNR and per-sector interpretations described here were later corrected. See the current README and embedded protocol schema. This narrative is not validation evidence for this fork.
+
 # From Conversation to Telemetry: A Second Case Study in Domain-Expert-Driven Code Generation, and a Test of the Domain-Expert Specification Schema
 
 **Author:** A. McLeod
