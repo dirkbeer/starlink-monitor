@@ -892,7 +892,10 @@ class SatelliteMatcher:
             name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
             if l1.startswith("1 ") and l2.startswith("2 "):
                 try:
-                    recs.append(Satrec.twoline2rv(l1, l2))
+                    record = Satrec.twoline2rv(l1, l2)
+                    if not finite(record.no_kozai) or record.no_kozai <= 0:
+                        raise ValueError("Invalid TLE mean motion")
+                    recs.append(record)
                     names.append(name.strip())
                 except Exception:
                     pass

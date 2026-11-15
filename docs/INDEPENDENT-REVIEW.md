@@ -1,4 +1,4 @@
-# Independent review of the Linux reliability fixes
+# Independent review of the desktop reliability fixes
 
 Compare `upstream/main` (AndyMcLeod/starlink-monitor) with this branch. Review the
 implementation independently before using the list below as a coverage checklist.
@@ -46,7 +46,9 @@ The integration fixture uses a real local gRPC server, real Tk widgets under Xvf
 a pseudo-terminal with checksum-valid GPS sentences, CSV files, and synthetic
 orbital elements. It includes a deliberate RPC outage and reconnection. It does
 not validate a physical dish's protocol mappings or orbital identification.
-Windows is explicitly outside this fork's validation scope. Usage remains an
+Windows CI runs the same regression and GUI tests using a pyserial loopback
+transport, plus native directory and single-file builds. Physical COM-device
+unplug/replug and dish protocol behavior still require real hardware. Native Windows CI results are still pending. Usage remains an
 estimate; periods without observations are excluded, not invented.
 
 Suggested prompt for Claude:
@@ -54,8 +56,14 @@ Suggested prompt for Claude:
 > Independently review this PR at its exact head commit. Read the diff and relevant
 > surrounding code, run the documented tests, and challenge both implementation
 > and test coverage. Focus on data integrity, failure recovery, concurrency,
-> generated-code trust, and Linux packaging. Try to reproduce regressions and
+> generated-code trust, and desktop packaging. Try to reproduce regressions and
 > missed edge cases. Do not simply confirm the author's claims. Give actionable
 > findings with severity and file/line references; distinguish demonstrated bugs
 > from hardware-dependent uncertainties. Do not modify files or post comments
 > unless asked.
+
+Local cross-platform evidence: the regression and GUI integration checks pass
+under Linux and Windows Python 3.11 under Wine. The Wine integration uses SGP4's
+supported pure-Python backend because the accelerated Windows parser returned
+invalid elements in that environment. CI intentionally tests the normal Windows
+wheel, so a native runner must verify the accelerated path before release.

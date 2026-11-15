@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a standalone Linux executable of the Starlink dashboard with PyInstaller.
+"""Build a standalone desktop executable of the Starlink dashboard with PyInstaller.
 
 Why this script exists: the app normally compiles its embedded protobuf at first
 run by invoking ``python -m grpc_tools.protoc``. A frozen .exe has no interpreter
@@ -13,7 +13,7 @@ Usage:
     python build_exe.py --onedir    # folder build instead of one file (faster launch)
 
 Requires: pip install pyinstaller   (the app's own runtime deps must already be
-installed in the same interpreter). Linux builds are validated in CI. Run it with the SAME python you run the app
+installed in the same interpreter). Linux and Windows builds are covered by CI. Run it with the SAME python you run the app
 with, so the frozen build matches the tested environment.
 """
 import argparse
@@ -82,7 +82,6 @@ def build(console=False, onedir=False):
            "--collect-submodules", "grpc",
            "--collect-data", "grpc",
            "--collect-all", "sgp4",
-           "--collect-all", "PIL",
            # pkg_resources/setuptools get dragged in by metadata collection but
            # nothing here needs them at runtime; their rthook fails on a missing
            # 'jaraco' dep, so drop both to skip that hook entirely.

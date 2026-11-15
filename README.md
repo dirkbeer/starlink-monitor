@@ -5,11 +5,11 @@ It connects directly to the dish's **local gRPC API** — no Starlink app, Space
 login, or internet account required. By default only the local dish and local serial receiver are accessed. Optional external services require opt-in.
 
 
-## Maintained Linux fork
+## Reliability and validation
 
-This fork repairs telemetry history, GPS validity, logging recovery, and the other
-issues identified in the repository review. Linux is the supported validation
-target; the Windows notes below describe upstream packaging, not tested support.
+This version repairs telemetry history, GPS validity, logging recovery, and the other
+issues identified in the repository review. Linux is validated locally. Windows regression, GUI, and packaging checks are also
+configured in CI; native Windows validation is pending.
 
 ```bash
 python3 -m venv .venv
@@ -50,8 +50,8 @@ xvfb-run -a .venv/bin/python tests/integration.py
 ```
 
 The integration test uses local gRPC, pseudo-terminal GPS, synthetic orbital data,
-and temporary CSV output; no dish or internet access is needed. CI tests Linux on
-Python 3.11 and 3.14 and builds a Linux executable. See
+and temporary CSV output; no dish or internet access is needed. CI is configured for Linux and Windows on Python 3.11 and 3.14 and builds
+platform-native executables. See
 [review guidance](docs/INDEPENDENT-REVIEW.md) for independent verification.
 
 ![Main window](docs/screenshot-main.png)
@@ -172,7 +172,7 @@ Notes:
   `%TEMP%` on every launch, which is slow from a memory card; `--onedir` (distribute
   the whole `dist/StarlinkMonitor/` folder, e.g. zipped) launches faster.
 - Build with the **same Python** you run the app with, so the frozen build matches
-  the tested environment. The optional `sgp4`/`numpy`/`Pillow` packages are bundled
+  the tested environment. The optional `sgp4`/`numpy` packages are bundled
   automatically when present, so the satellite sky map works in the exe.
 
 ---

@@ -42,7 +42,8 @@ class RegressionTests(unittest.TestCase):
     def test_proto_uses_private_directory_and_generates_both_modules(self):
         sd.ensure_proto_compiled()
         self.assertNotEqual(sd.PROTO_DIR, Path(tempfile.gettempdir())/'starlink_proto')
-        self.assertEqual(sd.PROTO_DIR.stat().st_mode & 0o077, 0)
+        if os.name != "nt":
+            self.assertEqual(sd.PROTO_DIR.stat().st_mode & 0o077, 0)
         for name in ('starlink_pb2', 'starlink_pb2_grpc'):
             module = importlib.import_module(name)
             self.assertEqual(Path(module.__file__).parent, sd.PROTO_DIR)
@@ -206,6 +207,20 @@ class RegressionTests(unittest.TestCase):
             d._drain_events()
         worker.assert_called_once()
         worker.return_value.start.assert_called_once()
+
+    def test_invalid_cached_orbits_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)/'tle.txt'
+            cache.write_text('INVALID\n'
+                '1 25544U 98067A   26319.50000000  .00016717  00000-0  10270-3 0  9999\n'
+                '2 25544  51.6416  77.2154 0006703 130.5360 325.0288 00.00000000400000\n')
+            matcher = sd.SatelliteMatcher()
+            matcher.CACHE = cache
+            with patch.object(matcher,'_refresh_cache'):
+                ok, message = matcher.load()
+            self.assertFalse(ok)
+            self.assertIn('no TLEs',message)
+            self.assertIsNone(matcher._array)
 
     def test_stale_gps_callbacks_from_replaced_reader_are_ignored(self):
         d = dashboard()

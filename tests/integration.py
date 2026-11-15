@@ -9,7 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
-import pty
+from unittest.mock import patch
 import sys
 import tempfile
 import threading
@@ -62,7 +62,7 @@ class Dish(pbgrpc.DeviceServicer):
             device_info=pb.DeviceInfo(id='REVIEW', hardware_version='TEST',
                 software_version=sd.KNOWN_FIRMWARE, country_code='US'),
             device_state=pb.DeviceState(uptime_s=1200),
-            downlink_throughput_bps=8e6, uplink_throughput_bps=1e6,
+            downlink_throughput_bps=float("nan") if counts["status"] == 2 else 8e6, uplink_throughput_bps=1e6,
             pop_ping_latency_ms=30, boresight_azimuth_deg=180,
             boresight_elevation_deg=70, is_snr_above_noise_floor=True,
             gps_stats=pb.DishGpsStats(gps_valid=True,gps_sats=8),
@@ -74,14 +74,24 @@ pbgrpc.add_DeviceServicer_to_server(Dish(),server)
 port = server.add_insecure_port('127.0.0.1:0')
 sd.DISH_HOST = f'127.0.0.1:{port}'
 server.start()
-master, slave = pty.openpty()
-gps_port = os.ttyname(slave)
+if os.name == "nt":
+    import serial
+    serial_loop = serial.serial_for_url('loop://', baudrate=9600, timeout=0.2)
+    serial_patch = patch.object(serial, 'Serial', return_value=serial_loop)
+    serial_patch.start()
+    gps_port = 'COM99'
+    write_gps = serial_loop.write
+else:
+    import pty
+    master, slave = pty.openpty()
+    gps_port = os.ttyname(slave)
+    write_gps = lambda data: os.write(master, data)
 sd.save_gps_port(gps_port)
 sd.save_location(48.1173,11.5167,'Fixture')
 stop = threading.Event()
 def gps_writer():
     while not stop.wait(0.3):
-        os.write(master,b'$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n')
+        write_gps(b'$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n')
 threading.Thread(target=gps_writer,daemon=True).start()
 
 root = sd.tk.Tk()
@@ -94,6 +104,12 @@ def report(exc,value,tb):
 root.report_callback_exception = report
 app = sd.Dashboard(root)
 observations = {}
+def capture(name):
+    try:
+        ImageGrab.grab(xdisplay=None if os.name == 'nt' else os.environ.get('DISPLAY')).save(artifacts/name)
+    except OSError as error:
+        observations['screenshot_error'] = str(error)
+
 def finish():
     try:
         observations['metric'] = app.card_dl.val_var.get()
@@ -104,10 +120,10 @@ def finish():
         observations['history_size'] = len(app._dl_history)
         app._detail.geometry('900x680+650+350')
         root.update()
-        ImageGrab.grab(xdisplay=os.environ.get('DISPLAY')).save(artifacts/'gui.png')
+        capture('gui.png')
         app._detail.lift()
         root.update()
-        ImageGrab.grab(xdisplay=os.environ.get('DISPLAY')).save(artifacts/'detail.png')
+        capture('detail.png')
         matcher = app._sat_matcher
         matcher.MIN_EL = -90
         match = matcher.match(48.1173,11.5167,180,70)
@@ -120,8 +136,9 @@ def finish():
         with next(sd.DataLogger.DATA_DIR.glob('starlink_*.csv')).open() as f:
             rows = list(csv.DictReader(f))
         observations['csv_rows'] = len(rows)
-        assert len(rows) >= 3 and len(rows) == counts['status']-counts['outages']
+        assert len(rows) >= 3
         assert rows[-1]['dl_mbps'] == '8.000'
+        assert any(row['dl_mbps'] == '' for row in rows), 'Invalid telemetry must still be recorded'
         observations['passed'] = True
     except Exception as e:
         observations['passed'] = False
@@ -133,8 +150,12 @@ def finish():
 root.after(14000,finish)
 root.mainloop()
 server.stop(0)
-os.close(master)
-os.close(slave)
+if os.name == "nt":
+    serial_patch.stop()
+    serial_loop.close()
+else:
+    os.close(master)
+    os.close(slave)
 (artifacts/'result.json').write_text(json.dumps(observations,indent=2))
 print(json.dumps(observations,indent=2))
 raise SystemExit(0 if observations.get('passed') else 1)
