@@ -12,7 +12,9 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m unittest discover -s tests -v
 xvfb-run -a .venv/bin/python tests/integration.py
-.venv/bin/python build_exe.py --onedir --console
+xvfb-run -a .venv/bin/python tests/integration.py --offline
+.venv/bin/python build_exe.py --onedir
+xvfb-run -a .venv/bin/python tests/smoke_build.py dist/StarlinkMonitor/StarlinkMonitor
 ```
 
 If the checkout has no `upstream` remote, add it using
@@ -48,7 +50,7 @@ orbital elements. It includes a deliberate RPC outage and reconnection. It does
 not validate a physical dish's protocol mappings or orbital identification.
 Windows CI runs the same regression and GUI tests using a pyserial loopback
 transport, plus native directory and single-file builds. Physical COM-device
-unplug/replug and dish protocol behavior still require real hardware. Native Windows CI results are still pending. Usage remains an
+unplug/replug and dish protocol behavior still require real hardware. Hosted CI has not executed: GitHub reports an account billing lock. Native Windows validation remains outstanding. Usage remains an
 estimate; periods without observations are excluded, not invented.
 
 Suggested prompt for Claude:
@@ -67,3 +69,18 @@ under Linux and Windows Python 3.11 under Wine. The Wine integration uses SGP4's
 supported pure-Python backend because the accelerated Windows parser returned
 invalid elements in that environment. CI intentionally tests the normal Windows
 wheel, so a native runner must verify the accelerated path before release.
+
+Follow-up to Claude's review of `2a1764c`: CSV headers are published atomically
+and empty files reused; a real file-size-limit regression test covers failed
+header writes. Packaged smoke tests require successful status/history RPCs with
+a unique fixture response before checking GUI startup. TLE downloads share the
+tolerant cache parser, map borders retain culled polylines, the event pump always
+rearms, and CSV satellite matches use the current status sample. GPS reconnect
+waits asynchronously for the old reader, and frozen imports and disabled-map
+status no longer accumulate stale state. Checksums were already required by
+upstream; this requirement is now explicit in the README.
+
+The integration checks assert CSV values and ordering, wrapped history content,
+and an offline startup with external requests forbidden. The regression suite
+has 30 tests (the POSIX file-size-limit test is skipped on Windows). The native
+CI matrices disable fail-fast so independent jobs can finish after a failure.

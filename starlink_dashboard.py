@@ -15,7 +15,9 @@ import subprocess
 import tempfile
 import struct
 import queue
-from monitor_core import finite, formatted, history_samples, longitude_delta, draw_segments
+import io
+from monitor_core import (finite, formatted, history_samples, longitude_delta,
+                          draw_segments, visible_border_paths)
 import tkinter as tk
 from tkinter import ttk, font as tkfont
 from collections import deque
@@ -232,7 +234,9 @@ message Response {
 def ensure_proto_compiled():
     if FROZEN:
         # pb2 modules were generated at build time and bundled; no protoc needed.
-        sys.path.insert(0, str(_bundle_base()))
+        bundle_path = str(_bundle_base())
+        if bundle_path not in sys.path:
+            sys.path.insert(0, bundle_path)
         return
     global _PROTO_READY
     with _PROTO_LOCK:
@@ -798,15 +802,17 @@ class DataLogger:
         base = f"starlink_{today.isoformat()}"
         path = self.DATA_DIR / f"{base}.csv"
         suffix = 1
-        while path.exists() and not self._header_matches(path):
+        while path.exists() and path.stat().st_size and not self._header_matches(path):
             suffix += 1
             path = self.DATA_DIR / f"{base}_{suffix}.csv"
-        write_header = not path.exists()
+        if not path.exists() or not path.stat().st_size:
+            header = io.StringIO(newline="")
+            csv.writer(header).writerow(LOG_FIELDS)
+            # A failed/partial header never becomes a candidate day file.
+            atomic_write(path, header.getvalue())
         fh = open(path, "a", newline="", encoding="utf-8")
         try:
             writer = csv.writer(fh)
-            if write_header:
-                writer.writerow(LOG_FIELDS)
             fh.flush()
         except Exception:
             fh.close()
@@ -884,11 +890,23 @@ class SatelliteMatcher:
             if not self.CACHE.exists():
                 return False, f"TLE download failed: {e}"
             # fall back to stale cache rather than failing outright
+        names, recs = self._parse_catalogue(self.CACHE.read_text(encoding="utf-8"))
+        if not recs:
+            return False, "no TLEs parsed"
+        self._np = np
+        self._names = names
+        self._array = SatrecArray(recs)
+        age = (time.time() - self.CACHE.stat().st_mtime) / 3600
+        stale = " — STALE cache" if age >= self.REFRESH_H else ""
+        return True, f"{len(recs)} satellites; cache {age:.1f}h old{stale}"
+
+    @staticmethod
+    def _parse_catalogue(text):
+        from sgp4.api import Satrec
         names, recs = [], []
-        lines = [l.rstrip() for l in
-                 self.CACHE.read_text(encoding="utf-8").splitlines() if l.strip()]
+        lines = [l.rstrip() for l in text.splitlines() if l.strip()]
         i = 0
-        while i + 2 < len(lines) + 1 and i + 2 <= len(lines) - 1:
+        while i + 2 < len(lines):
             name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
             if l1.startswith("1 ") and l2.startswith("2 "):
                 try:
@@ -902,14 +920,7 @@ class SatelliteMatcher:
                 i += 3
             else:
                 i += 1
-        if not recs:
-            return False, "no TLEs parsed"
-        self._np = np
-        self._names = names
-        self._array = SatrecArray(recs)
-        age = (time.time() - self.CACHE.stat().st_mtime) / 3600
-        stale = " — STALE cache" if age >= self.REFRESH_H else ""
-        return True, f"{len(recs)} satellites; cache {age:.1f}h old{stale}"
+        return names, recs
 
     def match(self, lat_deg, lon_deg, az_deg, el_deg, alt_m=0.0, when=None):
         """Return (name, separation_deg, sat_az, sat_el) of the closest satellite,
@@ -1020,16 +1031,9 @@ class SatelliteMatcher:
         data = urllib.request.urlopen(req, timeout=30).read().decode()
         if len(data) < 100 or "\n1 " not in ("\n" + data):
             raise RuntimeError("empty/invalid TLE response")
-        from sgp4.api import Satrec
-        lines = [line.strip() for line in data.splitlines() if line.strip()]
-        if len(lines) % 3:
-            raise ValueError("Incomplete TLE catalogue")
-        for i in range(0, len(lines), 3):
-            if not lines[i+1].startswith("1 ") or not lines[i+2].startswith("2 "):
-                raise ValueError("Malformed TLE catalogue")
-            rec = Satrec.twoline2rv(lines[i+1], lines[i+2])
-            if not finite(rec.no_kozai) or rec.no_kozai <= 0:
-                raise ValueError("Invalid TLE orbit")
+        _, records = self._parse_catalogue(data)
+        if not records:
+            raise ValueError("No valid TLE orbits in download")
         atomic_write(self.CACHE, data)
 
     @staticmethod
@@ -1132,8 +1136,14 @@ class SkyMapPanel:
         self.canvas = tk.Canvas(self.frame, bg="#0a0f16", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=6, pady=(2, 6))
         self.borders = None
+        self.enabled = sat_enabled_var.get()
         self._last = None
         self.canvas.bind("<Configure>", lambda e: self._redraw())
+
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+        self._last = None
+        self._redraw()
 
     def set_borders(self, rings):
         self.borders = rings
@@ -1170,6 +1180,9 @@ class SkyMapPanel:
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
         if w < 10 or h < 10:
+            return
+        if not self.enabled:
+            c.create_text(w // 2, h // 2, text="Satellite tracking disabled", fill=DIM, font=F_SMALL)
             return
         if not self._last:
             c.create_text(w // 2, h // 2, text="Acquiring satellites…",
@@ -1210,14 +1223,11 @@ class SkyMapPanel:
         # --- borders / coastlines (only rings overlapping the view) ---
         if self.borders:
             for lons, lats, bbox in self.borders:
-                if bbox[3] < vb[1] or bbox[1] > vb[3]:
-                    continue
-                previous = None
-                for lon, lat in zip(lons, lats):
-                    point = proj(lat, lon)
-                    if previous and abs(point[0] - previous[0]) < 180 * 111.32 * coslat * ppk:
-                        c.create_line(*previous, *point, fill="#2c3a4a", width=1)
-                    previous = point
+                for path in visible_border_paths(lons, lats, bbox, dish_lon,
+                                                 dlon, vb[1], vb[3]):
+                    flat = [coordinate for delta, lat in path
+                            for coordinate in proj(lat, dish_lon + delta)]
+                    c.create_line(*flat, fill="#2c3a4a", width=1)
 
         # --- lat/lon graticule ---
         step = 2 if (vb[2] - vb[0]) > 8 else 1
@@ -1297,7 +1307,7 @@ def atomic_write(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=".starlink-")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         os.replace(name, path)
     finally:
@@ -1566,8 +1576,6 @@ class GpsReader:
         self._on_update = on_update  # callable(lat_or_None, lon_or_None, quality, num_sats)
         self._on_raw = on_raw        # callable(raw_nmea_line) for the live feed display
         self._stop = threading.Event()
-        self._sats_in_view = 0
-        self._gsv = {}
         self._last_gga = 0
         self._gga_quality = 0
         self._gga_sats = 0
@@ -1587,7 +1595,7 @@ class GpsReader:
 
         while not self._stop.is_set():
             try:
-                with serial.Serial(port, baud, timeout=2) as ser:
+                with serial.Serial(port, baud, timeout=0.2) as ser:
                     while not self._stop.is_set():
                         try:
                             raw = ser.readline()
@@ -1597,7 +1605,7 @@ class GpsReader:
                             self._parse(line)
                         except (ValueError, UnicodeError):
                             continue
-            except (OSError, serial.SerialException):
+            except Exception:
                 # Port unavailable — retry after a pause
                 self._on_update(None, None, -2, 0)
                 self._stop.wait(5)
@@ -1644,15 +1652,6 @@ class GpsReader:
             self._on_update(lat, lon, quality if valid_coordinates(lat, lon) else 0,
                             self._gga_sats if recent_gga else 0)
 
-        elif sentence.endswith("GSV"):
-            # $xxGSV,numMsg,msgNum,numSVsInView,...
-            # Fresh per-talker counts; fix telemetry uses GGA tracked satellites.
-            if len(parts) >= 4 and parts[3].isdigit():
-                count = int(parts[3])
-                now = time.monotonic()
-                self._gsv[sentence[:2]] = (now, count)
-                self._gsv = {k: v for k, v in self._gsv.items() if now-v[0] < GPS_MAX_AGE}
-                self._sats_in_view = sum(v[1] for v in self._gsv.values())
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -1707,7 +1706,6 @@ class Dashboard:
         self._sat_on = False           # plain mirror of the tk checkbox (thread-safe read)
         self._sat_loaded = False
         self._last_boresight = None    # (el, az) from most recent status
-        self._sat_window_start = None  # start of the handoff window we last matched for
         self._sat_base_status = ""     # sat status line sans the live countdown suffix
         self._last_sat_name = ""       # most recent likely-satellite match (for logging)
         self._last_sat_sep = ""
@@ -1744,26 +1742,37 @@ class Dashboard:
     def _drain_events(self):
         if self._stop.is_set():
             return
-        for _ in range(200):
-            try:
-                callback, args = self._events.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                callback(*args)
-            except Exception:
-                self.root.report_callback_exception(*sys.exc_info())
-        self._expire_gps()
-        if self._sat_on and not self._sat_loading and time.monotonic() >= self._sat_refresh_at:
-            self._sat_loading = True
-            threading.Thread(target=self._load_sat_tle, daemon=True).start()
-        self.root.after(100, self._drain_events)
+        try:
+            for _ in range(200):
+                try:
+                    callback, args = self._events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback(*args)
+                except Exception:
+                    self.root.report_callback_exception(*sys.exc_info())
+            self._expire_gps()
+            if self._sat_on and not self._sat_loading and time.monotonic() >= self._sat_refresh_at:
+                self._sat_loading = True
+                try:
+                    threading.Thread(target=self._load_sat_tle, daemon=True).start()
+                except Exception:
+                    self._sat_loading = False
+                    self._sat_refresh_at = time.monotonic() + 60
+                    raise
+        except Exception:
+            self._recording_error.set("Monitor update error; retrying (see crash.log)")
+            self.root.report_callback_exception(*sys.exc_info())
+        finally:
+            if not self._stop.is_set():
+                self.root.after(100, self._drain_events)
 
     def _on_toggle_sat(self):
         self._sat_generation += 1
         self._sat_on = self._sat_enabled.get()
+        self.sky_map.set_enabled(self._sat_on)
         self._last_sat_name, self._last_sat_sep = "", ""
-        self._sat_window_start = None
         if not self._sat_on:
             self._sat_status_var.set("Tracking disabled")
             self.detail_info.set("Likely Sat", "--", DIM)
@@ -1786,8 +1795,9 @@ class Dashboard:
         if ok:
             self._sat_matcher = matcher
             self._sat_loaded = True
-            self._sat_window_start = None
-        self._tle_status = msg if ok else "Refresh failed; prior catalogue retained: " + msg
+        self._tle_status = (msg if ok else
+                            ("Refresh failed; prior catalogue retained: " if self._sat_loaded
+                             else "Satellite catalogue unavailable: ") + msg)
         if self._sat_on:
             self._sat_status_var.set(self._tle_status)
 
@@ -1795,35 +1805,34 @@ class Dashboard:
         if generation == self._sat_generation and self._sat_on:
             self._show_sat_match(*args)
 
-    def _maybe_match_satellite(self):
-        """Runs in the poll thread. The dish holds one satellite per 15 s handoff
-        window, so re-match only when the window rolls over; otherwise just refresh
-        the countdown to the next handoff. Vectorised, never blocks the UI."""
+    def _maybe_match_satellite(self, status, timestamp):
+        """Return a match for this sample; deliver it atomically with the CSV row."""
         if not (self._sat_on and self._sat_loaded):
-            return
+            return None
         generation = self._sat_generation
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
         start, end = handoff_window(now)
         remain = (end - now).total_seconds()
-        if self._sat_window_start == start:
-            # still inside the current lock window: identity is unchanged, tick clock
-            self._post(self._update_handoff_countdown, remain)
-            return
-        bs = self._last_boresight
-        lat = self.location_panel._dish_lat
-        lon = self.location_panel._dish_lon
-        if bs is None or lat is None or lon is None:
-            self._post(self._deliver_sat_match, generation, None, "need GPS fix + pointing", remain)
-            return
-        self._sat_window_start = start
-        try:
-            # Evaluate at `now` so boresight and satellite positions are contemporaneous;
-            # the result then stands for the remainder of this handoff window.
-            res = self._sat_matcher.match(lat, lon, bs[1], bs[0], when=now)
-        except Exception as e:
-            self._post(self._deliver_sat_match, generation, None, str(e)[:40], remain)
-            return
-        self._post(self._deliver_sat_match, generation, res, None, remain)
+        el, az = status.boresight_elevation_deg, status.boresight_azimuth_deg
+        lat, lon = self.location_panel._dish_lat, self.location_panel._dish_lon
+        if not (finite(el) and finite(az) and valid_coordinates(lat, lon)):
+            return generation, None, "need GPS fix + pointing", remain
+        matcher = self._sat_matcher
+        key = (generation, start, lat, lon, el, az, id(matcher))
+        if key != getattr(self, "_match_cache_key", None):
+            try:
+                result = matcher.match(lat, lon, az, el, when=now)
+                value = result, None
+            except Exception as e:
+                value = None, str(e)[:80]
+            self._match_cache_key, self._match_cache_value = key, value
+        result, error = self._match_cache_value
+        return generation, result, error, remain
+
+    def _show_connection_error(self, message):
+        self._last_sat_name, self._last_sat_sep = "", ""
+        self.detail_info.set("Likely Sat", "--", DIM)
+        self.status_bar.update(False, message)
 
     def _load_borders(self):
         ok, _msg = self._border_map.load()
@@ -1877,7 +1886,8 @@ class Dashboard:
         The dish may switch satellites when this reaches zero (or hold the same one)."""
         if not self._sat_on:
             return
-        base = self._sat_base_status + " · " + getattr(self, "_tle_status", "")
+        base = " · ".join(part for part in
+                          (self._sat_base_status, getattr(self, "_tle_status", "")) if part)
         if base and remain is not None:
             self._sat_status_var.set(f"{base}  ·  next handoff in {remain:0.0f} s")
         elif base:
@@ -1889,13 +1899,20 @@ class Dashboard:
         generation = self._gps_generation
         if self._gps_reader is not None:
             self._gps_reader.stop()
-            self._gps_reader._thread.join(timeout=2.5)
         self._apply_gps_update(None, None, 0, 0)
+        self.location_panel.set_gps_connecting(port)
+        self._start_gps_when_ready(generation, port)
+
+    def _start_gps_when_ready(self, generation, port):
+        if self._stop.is_set() or generation != self._gps_generation:
+            return
+        if self._gps_reader is not None and self._gps_reader._thread.is_alive():
+            self.root.after(50, self._start_gps_when_ready, generation, port)
+            return
         self._gps_reader = GpsReader(
             port, GPS_BAUD,
             lambda *args: self._post(self._deliver_gps, generation, *args),
             on_raw=lambda line: self._post(self._deliver_raw, generation, line))
-        self.location_panel.set_gps_connecting(port)
 
     def _deliver_gps(self, generation, *args):
         if generation == self._gps_generation:
@@ -1904,9 +1921,6 @@ class Dashboard:
     def _deliver_raw(self, generation, line):
         if generation == self._gps_generation:
             self.location_panel.append_nmea(line)
-
-    def _on_gps_update(self, lat, lon, quality, num_sats):
-        self._post(self._apply_gps_update, lat, lon, quality, num_sats)
 
     def _apply_gps_update(self, lat, lon, quality, num_sats):
         self._gps_received = time.monotonic()
@@ -1919,7 +1933,6 @@ class Dashboard:
             self.location_panel._dish_lat = self.location_panel._dish_lon = None
             self._last_sat_name, self._last_sat_sep = "", ""
             self._sat_generation += 1
-            self._sat_window_start = None
         self.location_panel.set_gps_status(lat if valid else None, lon if valid else None,
                                            quality, num_sats)
 
@@ -1928,18 +1941,13 @@ class Dashboard:
                 and time.monotonic() - self._gps_received > GPS_MAX_AGE):
             self._apply_gps_update(None, None, 0, 0)
 
-    def _on_gps_raw(self, line):
-        self._post(self.location_panel.append_nmea, line)
-
     def _on_close(self):
         self._stop.set()
         if self._gps_reader is not None:
             self._gps_reader.stop()
-        if self._client is not None:
-            self._client.close()
-        self._poll_thread.join(timeout=1)
-        if self._gps_reader is not None:
-            self._gps_reader._thread.join(timeout=2.5)
+        client = self._client
+        if client is not None:
+            client.close()
         self._logger.close()
         self.root.destroy()
 
@@ -2137,7 +2145,6 @@ class Dashboard:
             save_location(lat, lon, label)
             self._location_source = "manual"
             self.location_panel.set_dish_location(lat, lon, label)
-            self._sat_window_start = None
             dlg.destroy()
 
         btn_frame = tk.Frame(dlg, bg=BG)
@@ -2167,8 +2174,9 @@ class Dashboard:
                     except Exception:
                         pass  # Current telemetry remains useful without history.
                 status = self._client.get_status()
-                self._post(self._apply_status, status, time.time())
-                self._maybe_match_satellite()
+                timestamp = time.time()
+                match = self._maybe_match_satellite(status, timestamp)
+                self._post(self._apply_status, status, timestamp, match)
                 self._error_count = 0
             except Exception as e:
                 self._error_count += 1
@@ -2176,7 +2184,8 @@ class Dashboard:
                     self._client.close()
                 self._client = None
                 first = True
-                self._post(self.status_bar.update, False,
+                self._match_cache_key = None
+                self._post(self._show_connection_error,
                            f"Error ({self._error_count}): {str(e)[:80]}")
             try:
                 self._update_sky_map()
@@ -2203,9 +2212,12 @@ class Dashboard:
         self._ul_history.extend(ul)
         self._draw_history()
 
-    def _apply_status(self, s, timestamp=None):
+    def _apply_status(self, s, timestamp=None, match=None):
         timestamp = time.time() if timestamp is None else timestamp
         self._expire_gps()
+        self._last_sat_name, self._last_sat_sep = "", ""
+        if match is not None:
+            self._deliver_sat_match(*match)
         dl = s.downlink_throughput_bps / 1e6
         ul = s.uplink_throughput_bps / 1e6
         el = s.boresight_elevation_deg
@@ -2467,7 +2479,37 @@ def _setup_crash_logging(root):
     root.report_callback_exception = _report
 
 
+def protocol_selftest(output):
+    """Exercise the packaged client against an explicit endpoint, without Tk."""
+    import json
+    client = None
+    try:
+        client = StarlinkClient()
+        status = client.get_status()
+        history = client.get_history()
+        result = {"ok": True, "device_id": status.device_info.id,
+                  "latency_ms": status.pop_ping_latency_ms,
+                  "history_samples": len(history.pop_ping_drop_rate)}
+    except Exception as error:
+        result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+    finally:
+        if client is not None:
+            client.close()
+    atomic_write(Path(output), json.dumps(result))
+    return 0 if result["ok"] else 1
+
+
 def main():
+    global DISH_HOST
+    import argparse
+    parser = argparse.ArgumentParser(description="Starlink dish monitor")
+    parser.add_argument("--dish-host", default=DISH_HOST, help="gRPC host:port")
+    parser.add_argument("--selftest", metavar="RESULT_JSON",
+                        help="test status/history RPCs, write a result, and exit")
+    args = parser.parse_args()
+    DISH_HOST = args.dish_host
+    if args.selftest:
+        raise SystemExit(protocol_selftest(args.selftest))
     # A --windowed frozen build has no console: sys.stdout/stderr are None, and the
     # startup print()s below would crash before the UI appears. Route them to a log
     # next to the .exe so nothing is lost and startup stays diagnosable.

@@ -23,8 +23,6 @@ def sentence(payload):
 
 def gps():
     g = sd.GpsReader.__new__(sd.GpsReader)
-    g._sats_in_view = 0
-    g._gsv = {}
     g._last_gga = 0
     g._gga_quality = g._gga_sats = 0
     g._on_update = Mock()
@@ -73,7 +71,7 @@ class RegressionTests(unittest.TestCase):
         client.get_status.return_value = status()
         d._error_count = 0
         d._connect = lambda: setattr(d,'_client',client)
-        d._maybe_match_satellite = d._update_sky_map = Mock()
+        d._maybe_match_satellite = d._update_sky_map = Mock(return_value=None)
         d._stop = Mock()
         d._stop.is_set.side_effect = [False,True]
         d._poll_loop()
@@ -117,11 +115,11 @@ class RegressionTests(unittest.TestCase):
         for value,hemi in [('1260','N'),('nan','N'),('9100','N'),('1200','Q')]:
             self.assertIsNone(sd._nmea_to_deg(value,hemi))
 
-    def test_satellite_counts_can_decrease(self):
+    def test_fix_satellite_counts_can_decrease(self):
         g = gps()
-        g._parse(sentence('GPGSV,1,1,12'))
-        g._parse(sentence('GPGSV,1,1,04'))
-        self.assertEqual(g._sats_in_view,4)
+        for count in (12,4):
+            g._parse(sentence(f'GPGGA,123519,4807.038,N,01131.000,E,1,{count:02},0.9,545.4,M,46.9,M,,'))
+        self.assertEqual(g._on_update.call_args.args[3],4)
 
     def test_serial_failure_closes_and_reopens(self):
         import serial
@@ -246,14 +244,12 @@ class RegressionTests(unittest.TestCase):
         panel.canvas = Mock()
         panel.canvas.winfo_width.return_value = 900
         panel.canvas.winfo_height.return_value = 600
+        panel.enabled = True
         panel.borders = None
         panel._last = (0,179,dict(name=['TEST'],sublat=[0],sublon=[-179]),'', '',None,None)
         panel._redraw_impl()
         texts = [c.kwargs.get('text','') for c in panel.canvas.create_text.call_args_list]
         self.assertIn('1 sats shown · 450 km L/R',texts)
-
-    def test_external_services_are_opt_in(self):
-        self.assertEqual(sd.EXTERNAL_SERVICES,os.environ.get('STARLINK_EXTERNAL_SERVICES','0')=='1')
 
     def test_nonfinite_samples_do_not_poison_logging_or_usage(self):
         d = dashboard()

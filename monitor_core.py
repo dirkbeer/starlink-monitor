@@ -39,6 +39,30 @@ def longitude_delta(lon, origin):
     return (lon - origin + 180) % 360 - 180
 
 
+def visible_border_paths(lons, lats, bbox, origin, half_width, south, north):
+    """Cull geographically, preserving polylines and splitting only wrap jumps."""
+    if bbox[3] < south or bbox[1] > north:
+        return []
+    span = bbox[2] - bbox[0]
+    if span <= 180:
+        center = longitude_delta((bbox[0] + bbox[2]) / 2, origin)
+        if center + span/2 < -half_width or center - span/2 > half_width:
+            return []
+    paths, current = [], []
+    for lon, lat in zip(lons, lats):
+        delta = longitude_delta(lon, origin)
+        if current and abs(delta-current[-1][0]) > 180:
+            paths.append(current)
+            current = []
+        current.append((delta, lat))
+    paths.append(current)
+    return [path for path in paths if len(path) >= 2
+            and min(p[0] for p in path) <= half_width
+            and max(p[0] for p in path) >= -half_width
+            and min(p[1] for p in path) <= north
+            and max(p[1] for p in path) >= south]
+
+
 def draw_segments(canvas, points, **kwargs):
     """Draw finite runs, leaving visible gaps for missing observations."""
     run = []

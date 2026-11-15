@@ -250,8 +250,8 @@ The selected GPS port and any manually-entered dish coordinates are saved to
   `PERMISSION_DENIED` unless enabled on the dish. GPS **fix status** (valid, sat
   count, filter convergence) is always available via `gps_stats`.
 - **GPS.** NMEA sentences are read on a background thread; `$xxGGA` gives fix
-  quality + satellite count, `$xxRMC` gives the A/V status, and `*GSV` provides the
-  in-view count. A fix auto-populates the dish coordinates.
+  quality + satellite count, `$xxRMC` gives the A/V status, and GGA supplies the number of satellites used in the fix.
+  A valid `*hh` checksum is required; checksum-less or corrupted sentences are ignored. A fix auto-populates the dish coordinates.
 - **IP geolocation** (via opt-in HTTPS `ipwho.is`) is only an approximate public-IP location; it does not identify the dish or a ground station.
 - **Firmware check.** On the first poll the dish's reported firmware is compared
   against `KNOWN_FIRMWARE` (the build the field numbers were verified against). On

@@ -22,6 +22,8 @@ def dashboard():
     d._gps_received = None
     d._location_source = "manual"
     d._sat_generation = 0
+    d._sat_on = False
+    d._sat_loaded = False
     d._recording_error = Mock()
     d._last_gps = {}
     d._last_sat_name = d._last_sat_sep = ''
